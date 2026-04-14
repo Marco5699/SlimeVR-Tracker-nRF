@@ -1,4 +1,5 @@
 #include "globals.h"
+#include "test_mode.h"
 #include "sensor/sensor.h"
 #include "sensor/calibration.h"
 #include "connection/connection.h"
@@ -100,21 +101,29 @@ void configure_sense_pins(void)
 #endif
 	// Configure chgstat sense
 	if (!docked) {
+		bool ignore_charge_wake = IGNORE_CHARGE_WAKE_ON_VBUS && vbus_read();
+		if (ignore_charge_wake) {
+			LOG_INF("Skipped charge wake sense while VBUS is present");
+		}
 #if CHG_EXISTS
-		nrf_gpio_cfg_input(NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, chg_gpios), NRF_GPIO_PIN_PULLUP);
-		nrf_gpio_cfg_sense_set(
-			NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, chg_gpios),
-			chg_read() ? NRF_GPIO_PIN_SENSE_HIGH : NRF_GPIO_PIN_SENSE_LOW
-		);
-		LOG_INF("Configured chg sense");
+		if (!ignore_charge_wake) {
+			nrf_gpio_cfg_input(NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, chg_gpios), NRF_GPIO_PIN_PULLUP);
+			nrf_gpio_cfg_sense_set(
+				NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, chg_gpios),
+				chg_read() ? NRF_GPIO_PIN_SENSE_HIGH : NRF_GPIO_PIN_SENSE_LOW
+			);
+			LOG_INF("Configured chg sense");
+		}
 #endif
 #if STBY_EXISTS
-		nrf_gpio_cfg_input(NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, stby_gpios), NRF_GPIO_PIN_PULLUP);
-		nrf_gpio_cfg_sense_set(
-			NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, stby_gpios),
-			stby_read() ? NRF_GPIO_PIN_SENSE_HIGH : NRF_GPIO_PIN_SENSE_LOW
-		);
-		LOG_INF("Configured stby sense");
+		if (!ignore_charge_wake) {
+			nrf_gpio_cfg_input(NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, stby_gpios), NRF_GPIO_PIN_PULLUP);
+			nrf_gpio_cfg_sense_set(
+				NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, stby_gpios),
+				stby_read() ? NRF_GPIO_PIN_SENSE_HIGH : NRF_GPIO_PIN_SENSE_LOW
+			);
+			LOG_INF("Configured stby sense");
+		}
 #endif
 	}
 	// Configure sw0 sense
@@ -417,7 +426,11 @@ static void button_thread(void)
 			LOG_INF("Button was pressed %d times", num_presses);
 			last_press = 0;
 			if (num_presses == 1) {
-				sys_request_system_reboot(false);
+				if (test_mode_get()) {
+					LOG_INF("Button reboot blocked by test mode");
+				} else {
+					sys_request_system_reboot(false);
+				}
 			}
 #if CONFIG_USER_EXTRA_ACTIONS // TODO: extra actions are default until server can send commands to trackers
 			sys_reset_mode(num_presses - 1);
@@ -538,6 +551,15 @@ int sys_user_shutdown(void)
 	return 0;
 }
 
+void sys_command_shutdown(void)
+{
+	LOG_INF("Command shutdown requested");
+	reboot_counter_write(0);
+	set_led(SYS_LED_PATTERN_ONESHOT_POWEROFF, SYS_LED_PRIORITY_HIGHEST);
+	k_msleep(1500);
+	sys_request_system_off(false);
+}
+
 void sys_reset_mode(uint8_t mode)
 {
 	switch (mode) {
@@ -562,6 +584,17 @@ void sys_reset_mode(uint8_t mode)
 		LOG_INF("DFU requested");
 #if ADAFRUIT_BOOTLOADER
 		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_UF2_RESET;
+		sys_request_system_reboot(false);
+#endif
+#if NRF5_BOOTLOADER
+		gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
+#endif
+		break;
+	case 7:
+	case 8: // Reset mode DFU OTA
+		LOG_INF("DFU OTA requested");
+#if ADAFRUIT_BOOTLOADER
+		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_OTA_RESET;
 		sys_request_system_reboot(false);
 #endif
 #if NRF5_BOOTLOADER

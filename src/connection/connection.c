@@ -40,6 +40,8 @@ static uint8_t packet_sequence = 0;
 static int64_t last_ping_time = 0;
 static uint32_t ping_interval_ms = PING_INTERVAL_MS;
 
+#define PING_RESYNC_MIN_INTERVAL_MS 500
+
 LOG_MODULE_REGISTER(connection, LOG_LEVEL_INF);
 
 #ifndef CONFIG_CONNECTION_ENABLE_ACK
@@ -50,11 +52,11 @@ static bool no_ack = false;
 
 uint32_t get_ping_interval_ms(void)
 {
-	return ping_interval_ms;
+	return ping_interval_ms + esb_get_ping_backoff_ms();
 }
 
 static void connection_thread(void);
-K_THREAD_DEFINE(connection_thread_id, 768, connection_thread, NULL, NULL, NULL, 8, 0, 0);
+K_THREAD_DEFINE(connection_thread_id, 2048, connection_thread, NULL, NULL, NULL, 5, 0, 0);
 
 void connection_clocks_request_start(void)
 {
@@ -364,7 +366,8 @@ static int64_t last_info_time = 0;
 static int64_t last_status_time = 0;
 
 static int64_t last_sensor_quat_time = 0;
-#define SENSOR_QUAT_INTERVAL_MS 6
+#define SENSOR_QUAT_INTERVAL_TDMA_MS   2
+#define SENSOR_QUAT_INTERVAL_NOTDMA_MS 6
 
 /* Lookahead window: if a low-freq packet is within this many ms of being due,
  * piggyback it onto the current transmission as a composite sub-packet. */
@@ -432,7 +435,7 @@ void connection_thread(void)
 
 		/* Adaptive PING interval based on connection health */
 		if (get_status(SYS_STATUS_CONNECTION_ERROR)) {
-			ping_interval_ms = 2450;
+			ping_interval_ms = 1450;
 		} else {
 			ping_interval_ms = PING_INTERVAL_MS;
 		}
@@ -442,8 +445,28 @@ void connection_thread(void)
 			continue;
 		}
 
-		/* PING has highest priority */
-		if (now - last_ping_time >= ping_interval_ms) {
+		/* PING has highest priority.
+		 *
+		 * When TDMA is enabled and the last sync is getting stale
+		 * (>2× PING interval), force an early PING to re-sync before
+		 * the TDMA slot estimate drifts too far.  This prevents the
+		 * gradual TPS degradation caused by transmitting in wrong slots.
+		 */
+		uint32_t effective_ping_interval_ms = get_ping_interval_ms();
+		bool ping_due = (now - last_ping_time >= effective_ping_interval_ms);
+#if CONFIG_CONNECTION_TDMA
+		if (!ping_due && tdma_is_enabled()) {
+			int64_t sync_age = esb_get_sync_age_ms();
+			uint32_t resync_interval_ms = effective_ping_interval_ms / 2;
+			if (resync_interval_ms < PING_RESYNC_MIN_INTERVAL_MS) {
+				resync_interval_ms = PING_RESYNC_MIN_INTERVAL_MS;
+			}
+			if (sync_age > (int64_t)effective_ping_interval_ms * 2 && (now - last_ping_time) >= resync_interval_ms) {
+				ping_due = true;
+			}
+		}
+#endif
+		if (ping_due) {
 			uint8_t ping[ESB_PING_LEN] = {0};
 			ping[0] = ESB_PING_TYPE;
 			ping[1] = connection_get_id();
@@ -454,7 +477,14 @@ void connection_thread(void)
 			ping[ESB_PING_LEN - 1] = 0;
 			esb_write(ping, false, ESB_PING_LEN);
 			last_ping_time = now;
-			k_usleep(900);
+			/*
+			 * Wait for PING TX to complete (including ACK wait and
+			 * up to 2 retransmits at 310µs retransmit_delay).
+			 * Worst case: ~1.5ms.  Previous 900µs was insufficient
+			 * and caused esb_start_tx() -EBUSY for the next data
+			 * packet.
+			 */
+			k_usleep(1600);
 			continue;
 		}
 
@@ -465,8 +495,11 @@ void connection_thread(void)
 		}
 
 		/* Determine which data types are due or nearly due */
+		int quat_interval_ms = tdma_is_enabled()
+			? SENSOR_QUAT_INTERVAL_TDMA_MS
+			: SENSOR_QUAT_INTERVAL_NOTDMA_MS;
 		bool quat_ready = quat_update_time &&
-				  (now - last_sensor_quat_time >= SENSOR_QUAT_INTERVAL_MS);
+				  (now - last_sensor_quat_time >= quat_interval_ms);
 		bool mag_due = mag_update_time && (now - last_mag_time > 100);
 		bool info_due = (now - last_info_time > 100);
 		bool status_due = (now - last_status_time > 1000);

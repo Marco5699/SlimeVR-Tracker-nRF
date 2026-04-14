@@ -24,6 +24,7 @@
 #include "sensor/calibration.h"
 #include "sensor/sensor.h"
 #include "system/system.h"
+#include "system/test_mode.h"
 #include "system/watchdog.h"
 #include "connection.h"
 #include "zephyr/sys/time_units.h"
@@ -80,10 +81,24 @@ static bool esb_paired = false;
 #define PING_RECOVERY_THRESHOLD 1
 #endif
 
+#define PING_BACKOFF_LVL1_THRESHOLD 2
+#define PING_BACKOFF_LVL2_THRESHOLD 5
+#define PING_BACKOFF_LVL3_THRESHOLD 10
+#define PING_BACKOFF_LVL4_THRESHOLD 20
+#define PING_BACKOFF_LVL1_MS        500
+#define PING_BACKOFF_LVL2_MS        1500
+#define PING_BACKOFF_LVL3_MS        4000
+#define PING_BACKOFF_LVL4_MS        9000
+
+#define TX_BUSY_RECOVERY_RETRY_COUNT    10
+#define TX_BUSY_RECOVERY_RETRY_DELAY_US 200
+#define TX_BUSY_RECOVERY_THRESHOLD      8
+#define TX_BUSY_RECOVERY_WINDOW_MS      250
+
 LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 
 static void esb_thread(void);
-K_THREAD_DEFINE(esb_thread_id, 512, esb_thread, NULL, NULL, NULL, 6, 0, 0);
+K_THREAD_DEFINE(esb_thread_id, 1024, esb_thread, NULL, NULL, NULL, 6, 0, 0);
 static int64_t last_tx_time = 0;
 
 static uint32_t ping_success_streak = 0; // consecutive success counter
@@ -94,6 +109,8 @@ static uint32_t ping_failures = 0;
 static uint32_t ping_ctr_sent = 0;
 static uint8_t ping_counter = 0;
 static int64_t ping_send_time = 0;
+static uint32_t tx_start_busy_streak = 0;
+static int64_t tx_start_busy_since = 0;
 
 // Track send cycles for recent PINGs (circular buffer)
 #define PING_HISTORY_SIZE 10
@@ -121,7 +138,7 @@ static uint32_t g_last_rx_raw_ticks = 0;
 static uint32_t g_last_sync_local_ticks = 0;
 static bool g_time_initialized = false;
 static int64_t g_last_sync_timestamp = 0;
-#define TIME_SYNC_TIMEOUT_MS 90000
+#define TIME_SYNC_TIMEOUT_MS 15000
 
 // Clock skew compensation (tracker vs receiver crystal frequency difference)
 static int32_t g_clock_skew_ppb = 0;         // Estimated clock skew in parts per billion
@@ -201,6 +218,54 @@ static int64_t last_enomem_time = 0;
 #define ENOMEM_ERROR_THRESHOLD 3    // Force recovery after N consecutive errors
 #define ENOMEM_ERROR_WINDOW_MS 1000 // Reset counter if no error for this duration
 
+static void esb_clear_time_sync_state(void)
+{
+	server_time_synced = false;
+	g_time_initialized = false;
+	g_last_sync_timestamp = 0;
+	g_last_rx_raw_ticks = 0;
+	g_last_sync_local_ticks = 0;
+	g_server_ticks_offset = 0;
+	g_clock_skew_ppb = 0;
+	g_skew_ref_offset = 0;
+	g_skew_ref_local_ticks = 0;
+	g_min_rtt_ticks = 10;
+	g_sync_update_count = 0;
+}
+
+static void esb_recover_stuck_tx(const char *reason)
+{
+	LOG_WRN("Recovering ESB TX path after %s", reason);
+
+	ping_pending = false;
+	ping_failed = false;
+	tx_start_busy_streak = 0;
+	tx_start_busy_since = 0;
+	esb_clear_time_sync_state();
+
+	esb_deinitialize();
+	k_msleep(1);
+	esb_initialize(true);
+}
+
+uint32_t esb_get_ping_backoff_ms(void)
+{
+	if (ping_failures >= PING_BACKOFF_LVL4_THRESHOLD) {
+		return PING_BACKOFF_LVL4_MS;
+	}
+	if (ping_failures >= PING_BACKOFF_LVL3_THRESHOLD) {
+		return PING_BACKOFF_LVL3_MS;
+	}
+	if (ping_failures >= PING_BACKOFF_LVL2_THRESHOLD) {
+		return PING_BACKOFF_LVL2_MS;
+	}
+	if (ping_failures >= PING_BACKOFF_LVL1_THRESHOLD) {
+		return PING_BACKOFF_LVL1_MS;
+	}
+
+	return 0;
+}
+
 bool clock_status = false;
 
 #if defined(CONFIG_CLOCK_CONTROL_NRF)
@@ -264,6 +329,14 @@ void clocks_stop(void)
 	if (!clock_status) {
 		return;
 	}
+
+	/* When using LF synthesizer, HFXO must remain active as it's the source
+	 * for the LF clock. Don't stop HFXO in this case. */
+	if (IS_ENABLED(CONFIG_CLOCK_USE_LF_SYNTH)) {
+		LOG_DBG("HF clock kept running for LF_SYNTH");
+		return;
+	}
+
 	clock_status = false;
 
 	onoff_release(clk_mgr);
@@ -342,6 +415,8 @@ void event_handler(struct esb_evt const *event)
 		tx_success_count++;
 		// Reset ENOMEM error counter on successful transmission
 		consecutive_enomem_errors = 0;
+		tx_start_busy_streak = 0;
+		tx_start_busy_since = 0;
 		if (esb_paired) {
 			clocks_stop();
 		}
@@ -710,6 +785,21 @@ void event_handler(struct esb_evt const *event)
 						// No history found - likely too old or buffer wrapped
 					}
 
+					/* Parse dynamic TDMA config from NORMAL PONG bytes 8-11.
+					 * Only valid when pong_flags == NORMAL (other commands
+					 * use bytes 8-11 for command-specific data). */
+					if (pong_flags == ESB_PONG_FLAG_NORMAL) {
+						uint8_t tdma_slot   = rx_payload.data[8];
+						uint8_t tdma_total  = rx_payload.data[9];
+						uint8_t tdma_sticks = rx_payload.data[10];
+						uint8_t tdma_epoch  = rx_payload.data[11];
+
+						if (tdma_slot != 0xFF && tdma_total > 0 && tdma_sticks > 0 &&
+						    tdma_epoch != tdma_get_config_epoch()) {
+							tdma_update_config(tdma_slot, tdma_total, tdma_sticks, tdma_epoch);
+						}
+					}
+
 					// handle remote commands and delayed execution
 					if (pong_flags != ESB_PONG_FLAG_NORMAL) {
 						if (received_remote_command == ESB_PONG_FLAG_NORMAL) {
@@ -761,6 +851,9 @@ void event_handler(struct esb_evt const *event)
 								break;
 							case ESB_PONG_FLAG_DFU:
 								cmd_name = "DFU";
+								break;
+							case ESB_PONG_FLAG_DFU_OTA:
+								cmd_name = "DFU_OTA";
 								break;
 							case ESB_PONG_FLAG_SET_CHANNEL:
 								cmd_name = "SET_CHANNEL";
@@ -947,7 +1040,7 @@ void esb_deinitialize(void)
 {
 	if (esb_initialized) {
 		esb_initialized = false;
-		k_msleep(10); // wait for pending transmissions
+		k_msleep(3); // wait for pending transmissions
 		esb_disable();
 	}
 	esb_initialized = false;
@@ -1034,12 +1127,10 @@ void esb_pair(void)
 	shutdown_requested = false;
 	ping_failed = false;
 	ping_pending = false;
+	tx_start_busy_streak = 0;
+	tx_start_busy_since = 0;
 	// Reset time sync state
-	server_time_synced = false;
-	g_time_initialized = false;
-	g_last_sync_timestamp = 0;
-	g_min_rtt_ticks = 10;
-	g_sync_update_count = 0;
+	esb_clear_time_sync_state();
 	if (!paired_addr[0]) // zero, no receiver paired
 	{
 		LOG_INF("Pairing");
@@ -1324,7 +1415,41 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 		ping_send_time = k_uptime_get();
 		ping_history_idx = (ping_history_idx + 1) % PING_HISTORY_SIZE;
 	}
-	esb_start_tx();
+	int tx_err = esb_start_tx();
+	if (tx_err == -EBUSY && queue_status == 0) {
+		/*
+		 * Radio still busy (e.g. PING ACK/retransmit in progress).
+		 * Wait briefly for the previous TX to complete, then retry.
+		 * Without this, the queued packet sits in the FIFO unsent
+		 * until the next esb_write() call.
+		 */
+		for (int retry = 0; retry < TX_BUSY_RECOVERY_RETRY_COUNT; retry++) {
+			k_usleep(TX_BUSY_RECOVERY_RETRY_DELAY_US);
+			tx_err = esb_start_tx();
+			if (tx_err != -EBUSY) {
+				break;
+			}
+		}
+		if (tx_err == -EBUSY) {
+			int64_t now = k_uptime_get();
+			if (tx_start_busy_since == 0 || (now - tx_start_busy_since) > TX_BUSY_RECOVERY_WINDOW_MS) {
+				tx_start_busy_since = now;
+				tx_start_busy_streak = 0;
+			}
+			tx_start_busy_streak++;
+			LOG_WRN("esb_start_tx still busy after retries, packet deferred (streak=%u)", tx_start_busy_streak);
+
+			if (tx_start_busy_streak >= TX_BUSY_RECOVERY_THRESHOLD) {
+				esb_recover_stuck_tx("repeated start_tx busy");
+			}
+		} else {
+			tx_start_busy_streak = 0;
+			tx_start_busy_since = 0;
+		}
+	} else if (tx_err == 0) {
+		tx_start_busy_streak = 0;
+		tx_start_busy_since = 0;
+	}
 	send_data = true;
 }
 
@@ -1382,6 +1507,14 @@ uint32_t esb_get_server_time(void)
 	return (uint32_t)(time_us / 1000ULL);
 }
 
+int64_t esb_get_sync_age_ms(void)
+{
+	if (!server_time_synced || g_last_sync_timestamp == 0) {
+		return -1;
+	}
+	return k_uptime_get() - g_last_sync_timestamp;
+}
+
 static void esb_thread(void)
 {
 #if CONFIG_CONNECTION_OVER_HID
@@ -1410,7 +1543,7 @@ static void esb_thread(void)
 			esb_initialize(true);
 		}
 		// Check for shutdown timeout if connection errors persist
-		if (ping_failures >= TX_ERROR_THRESHOLD) {
+		if (ping_failures >= TX_ERROR_THRESHOLD && !test_mode_get()) {
 #if CONFIG_CONNECTION_OVER_HID
 			// only raise error while not potentially communicating by usb
 			if (get_status(SYS_STATUS_CONNECTION_ERROR) == false && get_status(SYS_STATUS_USB_CONNECTED) == false && get_status(SYS_STATUS_CALIBRATION_RUNNING) == false)
@@ -1437,7 +1570,7 @@ static void esb_thread(void)
 				switch (received_remote_command) {
 				case ESB_PONG_FLAG_SHUTDOWN:
 					LOG_WRN("Executing remote command: SHUTDOWN");
-					sys_request_system_off(false);
+					sys_command_shutdown();
 					break;
 
 				case ESB_PONG_FLAG_CALIBRATE:
@@ -1503,6 +1636,16 @@ static void esb_thread(void)
 					tdma_set_enabled(false);
 					break;
 
+				case ESB_PONG_FLAG_TEST_MODE_ON:
+					LOG_INF("Executing remote command: TEST_MODE_ON");
+					test_mode_set(true);
+					break;
+
+				case ESB_PONG_FLAG_TEST_MODE_OFF:
+					LOG_INF("Executing remote command: TEST_MODE_OFF");
+					test_mode_set(false);
+					break;
+
 				case ESB_PONG_FLAG_REBOOT:
 					LOG_WRN("Executing remote command: REBOOT");
 					sys_request_system_reboot(false);
@@ -1523,6 +1666,19 @@ static void esb_thread(void)
 					sys_request_system_reboot(false);
 #else
 					LOG_WRN("Remote command: DFU not supported (no bootloader)");
+#endif
+					break;
+
+				case ESB_PONG_FLAG_DFU_OTA:
+#if CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+					LOG_WRN("Executing remote command: DFU_OTA (enter OTA bootloader)");
+#if CONFIG_BUILD_OUTPUT_UF2
+					NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_OTA_RESET;
+					k_msleep(2);
+#endif
+					sys_request_system_reboot(false);
+#else
+					LOG_WRN("Remote command: DFU_OTA not supported (no bootloader)");
 #endif
 					break;
 
