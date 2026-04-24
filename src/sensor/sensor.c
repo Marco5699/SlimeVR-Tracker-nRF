@@ -266,7 +266,7 @@ static const struct gpio_dt_spec int0 = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, int0_
 const char *sensor_get_sensor_imu_name(void)
 {
 	if (sensor_imu_id < 0)
-		return "None";
+		return "\033[38;5;196;1mNone\033[0m"; // color 196 (bright red), intense/bold
 	return dev_imu_names[sensor_imu_id];
 }
 
@@ -1066,6 +1066,22 @@ int sensor_init(void)
 	sensor_fusion_init = true;
 	last_mag_fusion_ticks = 0; // reset so first mag update uses nominal mag_actual_time as dt
 	// last_mag_fusion_ticks reset is sufficient; no extra state to clear.
+
+	if (connection_get_data_collection()) {
+		connection_send_raw_metadata(
+			gyro_actual_range,
+			accel_actual_range,
+			1.0f / gyro_actual_time,
+			1.0f / accel_actual_time,
+			mag_available && mag_enabled ? 1.0f / mag_actual_time : 0.0f,
+			(uint8_t)sensor_imu_id,
+			(uint8_t)sensor_mag_id
+		);
+		LOG_INF("Data collection mode: metadata sent (gyro %.0fdps, accel %.0fg, gyro ODR %.0fHz)",
+			(double)gyro_actual_range, (double)accel_actual_range,
+			1.0 / (double)gyro_actual_time);
+	}
+
 	return 0;
 }
 
@@ -1074,6 +1090,8 @@ int sensor_init(void)
 
 static int64_t last_status_time = 0;
 static int64_t max_loop_time = 0;
+
+static bool last_data_collection_state = false;
 
 #if DEBUG
 static int64_t last_acquisition_time = INT64_MAX;
@@ -1087,6 +1105,73 @@ static uint64_t total_loop_iterations = 0;
 #endif
 // Count actual mag samples fed to VQF since last status report (always tracked)
 static uint32_t mag_vqf_updates_since_status = 0;
+
+#if CONFIG_SENSOR_USE_VQF
+/*
+ * After a calibration change, vqf_reset_mag_ref() zeros VQF's magRef.
+ * Rather than waiting for VQF's natural convergence (~6s magNewFirstTime),
+ * re-compute magRef directly from the first calibrated mag samples.
+ *
+ *   norm = |m_cal|
+ *   dip  = -asin(dot(m_cal, up_hat) / norm)    [rad]
+ * where up_hat = accel / |accel| (accelerometer points up when stationary).
+ *
+ * Triggered by sensor_mag_ref_reset(); does NOT run on startup.
+ */
+#define MAG_REF_RECOMPUTE_SAMPLES 50
+#define MAG_REF_ACCEL_TOL 0.3f
+
+static bool mag_ref_recompute_active;
+static float mag_ref_norm_sum;
+static float mag_ref_dip_sum;
+static int mag_ref_count;
+
+static void sensor_mag_ref_accumulate(const float m_cal[3],
+                                      const float accel_sum[3], int accel_count)
+{
+	if (!mag_ref_recompute_active || accel_count == 0)
+		return;
+
+	float ax = accel_sum[0] / accel_count;
+	float ay = accel_sum[1] / accel_count;
+	float az = accel_sum[2] / accel_count;
+	float a_norm = sqrtf(ax * ax + ay * ay + az * az);
+	if (fabsf(a_norm - 1.0f) > MAG_REF_ACCEL_TOL)
+		return;
+
+	float m_norm = sqrtf(m_cal[0] * m_cal[0] + m_cal[1] * m_cal[1] + m_cal[2] * m_cal[2]);
+	if (m_norm < 0.01f)
+		return;
+
+	float inv_a = 1.0f / a_norm;
+	float m_dot_up = (m_cal[0] * ax + m_cal[1] * ay + m_cal[2] * az) * inv_a;
+	float sin_dip = m_dot_up / m_norm;
+	if (sin_dip > 1.0f) sin_dip = 1.0f;
+	if (sin_dip < -1.0f) sin_dip = -1.0f;
+
+	mag_ref_norm_sum += m_norm;
+	mag_ref_dip_sum += -asinf(sin_dip);
+	mag_ref_count++;
+
+	if (mag_ref_count >= MAG_REF_RECOMPUTE_SAMPLES) {
+		float avg_norm = mag_ref_norm_sum / mag_ref_count;
+		float avg_dip = mag_ref_dip_sum / mag_ref_count;
+		vqf_set_mag_ref(avg_norm, avg_dip);
+		mag_ref_recompute_active = false;
+		LOG_INF("Mag ref recomputed from %d samples: norm=%.4f dip=%.1f deg",
+			mag_ref_count, (double)avg_norm,
+			(double)(avg_dip * 180.0f / (float)M_PI));
+	}
+}
+
+void sensor_mag_ref_reset(void)
+{
+	mag_ref_recompute_active = true;
+	mag_ref_norm_sum = 0;
+	mag_ref_dip_sum = 0;
+	mag_ref_count = 0;
+}
+#endif /* CONFIG_SENSOR_USE_VQF */
 
 void sensor_loop(void)
 {
@@ -1113,6 +1198,34 @@ void sensor_loop(void)
 #if DEBUG
 			int64_t loop_begin = k_uptime_ticks();
 #endif
+
+			/* Detect data collection activation transition and send metadata */
+			bool dc_active = connection_get_data_collection();
+			if (dc_active && !last_data_collection_state) {
+				sys_interface_resume();
+				connection_send_raw_metadata(
+					gyro_actual_range,
+					accel_actual_range,
+					1.0f / gyro_actual_time,
+					1.0f / accel_actual_time,
+					mag_available && mag_enabled ? 1.0f / mag_actual_time : 0.0f,
+					(uint8_t)sensor_imu_id,
+					(uint8_t)sensor_mag_id
+				);
+				LOG_INF("Data collection activated: metadata sent");
+			} else if (dc_active && connection_raw_metadata_resend_due()) {
+				connection_send_raw_metadata(
+					gyro_actual_range,
+					accel_actual_range,
+					1.0f / gyro_actual_time,
+					1.0f / accel_actual_time,
+					mag_available && mag_enabled ? 1.0f / mag_actual_time : 0.0f,
+					(uint8_t)sensor_imu_id,
+					(uint8_t)sensor_mag_id
+				);
+			}
+			last_data_collection_state = dc_active;
+
 			// Resume devices
 			sys_interface_resume();
 
@@ -1185,6 +1298,18 @@ void sensor_loop(void)
 			connection_update_sensor_temp(temp);
 #endif
 
+			float raw_collect_temp_c = NAN;
+			int64_t temp_age_ms = k_uptime_get() - last_temp_time;
+#if CONFIG_SENSOR_USE_TCAL
+			if (last_temp_time >= 0 && temp_age_ms <= 1000) {
+				raw_collect_temp_c = sensor_tcal_temp_filter_initialized ? sensor_tcal_temp : sensor_tcal_temp_raw;
+			}
+#else
+			if (last_temp_time >= 0 && temp_age_ms <= 1000) {
+				raw_collect_temp_c = temp;
+			}
+#endif
+
 			// Debug info
 #if DEBUG
 			int64_t acquisition_time = k_uptime_ticks();
@@ -1202,6 +1327,10 @@ void sensor_loop(void)
 			bool new_mag_data = false;
 			if (mag_available && mag_enabled)
 				new_mag_data = sensor_mag->mag_read(raw_m); // returns false if no new sample (DRDY not set)
+
+			if (new_mag_data && connection_get_data_collection()) {
+				connection_queue_raw_mag(raw_m);
+			}
 
 			if (reconfig) // TODO: get rid of reconfig?
 			{
@@ -1243,12 +1372,33 @@ void sensor_loop(void)
 			float debug_raw_m[3] = {0};
 			float debug_cal_m[3] = {0};
 			bool debug_mag_valid = false;
+			static float raw_collect_a[3] = {0};
+
 			for (uint16_t i = 0; i < packets; i++)
 			{
 				float raw_a[3] = {0};
 				float raw_g[3] = {0};
 				if (sensor_imu->fifo_process(i, rawData, raw_a, raw_g))
 					continue; // skip on error
+
+				/* Pair the most recent accel tag with the next gyro tag once. */
+				if (raw_a[0] != 0 || raw_a[1] != 0 || raw_a[2] != 0) {
+					memcpy(raw_collect_a, raw_a, sizeof(raw_collect_a));
+				}
+
+				/* Only queue raw samples on gyro tags to avoid
+				 * duplicate entries from separate accel/gyro FIFO tags.
+				 * Pair with the latest accel sample if present; otherwise zeros. */
+				if (raw_g[0] != 0 || raw_g[1] != 0 || raw_g[2] != 0) {
+					struct raw_imu_sample raw_sample;
+					if (dc_active) {
+						memcpy(raw_sample.gyro, raw_g, sizeof(raw_sample.gyro));
+						memcpy(raw_sample.accel, raw_collect_a, sizeof(raw_sample.accel));
+						raw_sample.temp_c = raw_collect_temp_c;
+						connection_queue_raw_sample(&raw_sample);
+					}
+					memset(raw_collect_a, 0, sizeof(raw_collect_a));
+				}
 
 				// Debug: Log gyro values to see if they're all zero
 				static int gyro_log_count = 0;
@@ -1502,12 +1652,27 @@ void sensor_loop(void)
 				float uncalibrated_m[3] = {0};
 				memcpy(uncalibrated_m, raw_m, sizeof(uncalibrated_m)); // copy raw magnetometer data
 
+				// Feed raw mag to background online calibration accumulator
+				sensor_calibration_online_mag_sample(uncalibrated_m);
+
 				sensor_calibration_process_mag(raw_m);
 				float zero_m[3] = {0};
 				if (v_epsilon(raw_m, zero_m, 1e-6)) // if the magnetometer is not calibrated, skip and send raw data
 				{
 					memcpy(raw_m, uncalibrated_m, sizeof(uncalibrated_m));
 					mag_calibrated = false;
+				} else {
+					// Track calibrated mag norm for online quality assessment
+					// Only track when VQF reports no magnetic disturbance — including
+					// disturbed samples inflates norm CV and prevents online cal from stabilizing
+#if CONFIG_SENSOR_USE_VQF
+					if (!vqf_get_mag_dist_detected()) {
+#endif
+						float cal_norm_sq = raw_m[0] * raw_m[0] + raw_m[1] * raw_m[1] + raw_m[2] * raw_m[2];
+						sensor_calibration_track_mag_norm(sqrtf(cal_norm_sq));
+#if CONFIG_SENSOR_USE_VQF
+					}
+#endif
 				}
 				// Save mag data for debug output
 				if (sensor_debug_is_active()) {
@@ -1542,6 +1707,9 @@ void sensor_loop(void)
 					last_mag_fusion_ticks = now_ticks;
 					sensor_fusion->update_mag(m, mag_dt);
 					mag_vqf_updates_since_status++;
+#if CONFIG_SENSOR_USE_VQF
+					sensor_mag_ref_accumulate(m, a_sum, a_count);
+#endif
 				}
 
 				v_rotate(m, q3, m); // magnetic field in local device frame, no other transformation will be done
@@ -1772,6 +1940,30 @@ void sensor_loop(void)
 						(double)vqf_info.rest_deviations[0], (double)vqf_info.rest_deviations[1],
 						(double)vqf_info.bias[0], (double)vqf_info.bias[1], (double)vqf_info.bias[2],
 						(double)vqf_info.bias_sigma, (double)vqf_info.delta);
+#if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
+					printk("     Adapt: tauAcc:%.2fs motInt:%.3f\n",
+						(double)vqf_info.tau_acc, (double)vqf_info.motion_intensity);
+#endif
+					printk("     RestDiag: enter:%u exit:%u total:%.1fs last:%.1fs up:%.0fs rest%%:%.1f\n",
+						vqf_info.rest_enter_count, vqf_info.rest_exit_count,
+						(double)vqf_info.rest_total_s, (double)vqf_info.rest_last_duration_s,
+						(double)vqf_info.uptime_s,
+						(double)(vqf_info.uptime_s > 0 ? 100.0f * vqf_info.rest_total_s / vqf_info.uptime_s : 0));
+					printk("     BiasP[%.1f,%.1f,%.1f]\n",
+						(double)vqf_info.biasP[0], (double)vqf_info.biasP[1], (double)vqf_info.biasP[2]);
+					{
+						uint8_t n = vqf_info.rest_event_count;
+						if (n > 8) n = 8;
+						if (n > 0) {
+							printk("     RestLog(%u events):", vqf_info.rest_event_count);
+							for (uint8_t ri = 0; ri < n; ri++) {
+								printk(" %s@%.0fs",
+									vqf_info.rest_events[ri].entered ? "EN" : "EX",
+									(double)vqf_info.rest_events[ri].time_s);
+							}
+							printk("\n");
+						}
+					}
 					if (mag_enabled) {
 						printk("     Mag: DisAng:%.2f° CorrRate:%.2f°/s\n",
 							(double)vqf_info.mag_dis_angle, (double)vqf_info.mag_corr_rate);
@@ -1988,7 +2180,15 @@ void main_imu_restart(void)
 		// Use actual mag rate; guard against INFINITY (oneshot mode) with config-based fallback.
 		float fusion_mag_time = (mag_actual_time > 0.0f && mag_actual_time < 10.0f)
 			? mag_actual_time : (1.0f / CONFIG_SENSOR_MAG_ODR);
+#if CONFIG_SENSOR_USE_VQF
+		float saved_ref_norm, saved_ref_dip;
+		vqf_get_mag_ref(&saved_ref_norm, &saved_ref_dip);
+#endif
 		sensor_fusion->init(fusion_gyro_time, fusion_accel_time, fusion_mag_time);
+#if CONFIG_SENSOR_USE_VQF
+		if (saved_ref_norm > 0)
+			vqf_set_mag_ref(saved_ref_norm, saved_ref_dip);
+#endif
 		// Reset mag timing so the first post-restart update uses the nominal fallback
 		// instead of a potentially stale diff (which could be > 10s → updateMag fallback path).
 		last_mag_fusion_ticks = 0;
