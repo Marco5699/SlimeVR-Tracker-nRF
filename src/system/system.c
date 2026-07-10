@@ -4,6 +4,7 @@
 #include "sensor/calibration.h"
 #include "connection/connection.h"
 #include "connection/esb.h"
+#include "system/esb_ota.h"
 #include "watchdog.h"
 
 #include <zephyr/drivers/gpio.h>
@@ -15,6 +16,7 @@
 #include <hal/nrf_gpio.h>
 
 #include "system.h"
+#include "battery_tracker.h"
 #include "build_defines.h"
 
 static struct nvs_fs fs;
@@ -192,6 +194,7 @@ static int sys_retained_init(void)
 		sys_read(MAIN_MAG_BIAS_ID, &retained->magBAinv, sizeof(retained->magBAinv));
 		sys_read(MAIN_ACC_6_BIAS_ID, &retained->accBAinv, sizeof(retained->accBAinv));
 		sys_read(BATT_STATS_CURVE_ID, &retained->battery_pptt_curve, sizeof(retained->battery_pptt_curve));
+		sys_migrate_battery_curve();
 		sys_read(MAIN_GYRO_SENS_ID, &retained->gyroSensScale, sizeof(retained->gyroSensScale));
 		// If gyroSensScale was never set in NVS (all zeros), restore default values
 		if (retained->gyroSensScale[0] == 0.0f &&
@@ -210,12 +213,21 @@ static int sys_retained_init(void)
 #endif
 		sys_read(RF_CHANNEL_ID, &retained->rf_channel, sizeof(retained->rf_channel));
 		sys_read(MAG_ENABLED_ID, &retained->mag_enabled, sizeof(retained->mag_enabled));
+		sys_read(
+			MAG_ONLINE_CALIBRATION_ID,
+			&retained->mag_online_calibration_mode,
+			sizeof(retained->mag_online_calibration_mode)
+		);
+		if (retained->mag_online_calibration_mode > MAG_ONLINE_CALIBRATION_DISABLED) {
+			retained->mag_online_calibration_mode = MAG_ONLINE_CALIBRATION_DEFAULT;
+		}
 		retained_update();
 	} else {
 		LOG_INF("Validated RAM");
 		ram_retention_valid = true;
 		// Still need to init NVS for later sys_read/sys_write calls (e.g., battery_tracker)
 		sys_nvs_init();
+		sys_migrate_battery_curve();
 	}
 	return 0;
 }
@@ -447,10 +459,15 @@ static void button_thread(void)
 			last_press = k_uptime_get();
 			set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_HIGHEST);
 		}
+		/* Block all button actions during OTA (active or suppressed) */
+		bool ota_busy = esb_ota_is_active() || connection_get_ota_suppressed();
 		if (last_press && k_uptime_get() - last_press > 1000) {
 			LOG_INF("Button was pressed %d times", num_presses);
 			last_press = 0;
-			if (num_presses == 1) {
+			if (ota_busy) {
+				LOG_INF("Button action blocked by OTA");
+				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
+			} else if (num_presses == 1) {
 				if (test_mode_get()) {
 					LOG_INF("Button reboot blocked by test mode");
 				} else {
@@ -458,7 +475,9 @@ static void button_thread(void)
 				}
 			}
 #if CONFIG_USER_EXTRA_ACTIONS // TODO: extra actions are default until server can send commands to trackers
-			sys_reset_mode(num_presses - 1);
+			if (!ota_busy) {
+				sys_reset_mode(num_presses - 1);
+			}
 #endif
 			num_presses = 0;
 			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
@@ -466,10 +485,19 @@ static void button_thread(void)
 		}
 		if (press_time && k_uptime_get() - press_time > 1000 && button_read()) // Button is being held
 		{
-			if (sys_user_shutdown()) // held for 5 seconds, reset pairing
+			if (ota_busy) {
+				LOG_INF("Button hold blocked by OTA");
+				press_time = 0;
+				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
+				set_status(SYS_STATUS_BUTTON_PRESSED, false);
+			} else if (sys_user_shutdown())
 			{
+#if CONFIG_USER_EXTRA_ACTIONS
+				LOG_INF("Button hold timeout, shutdown canceled");
+#else
 				LOG_INF("Pairing requested");
 				esb_reset_pair();
+#endif
 				press_time = 0;
 				set_status(SYS_STATUS_BUTTON_PRESSED, false); // TODO: is needed?
 			}

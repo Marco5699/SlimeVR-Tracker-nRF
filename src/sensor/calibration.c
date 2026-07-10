@@ -54,58 +54,113 @@ static uint8_t magneto_progress;
 static uint8_t last_magneto_progress;
 static int64_t magneto_progress_time;
 
+K_MUTEX_DEFINE(calibration_request_lock);
+static int requested_calibration;
+
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+// Parameters for the requested gyro sensitivity calibration, latched by
+// sensor_request_calibration_sens() before the calibration thread runs.
+static uint8_t sens_cal_axis;
+static uint16_t sens_cal_revolutions;
+#endif
+
 // Only trust orientation updates when accel magnitude stays reasonably close to 1 g.
 // This rejects samples collected during strong linear acceleration while keeping
 // normal hand-rotation usable for calibration.
 #define MAG_CAL_ACCEL_MAG_MIN_SQ 0.75f
 #define MAG_CAL_ACCEL_MAG_MAX_SQ 1.3f
+#define CALIBRATION_SENSOR_INIT_WAIT_MS 10000
+#define CALIBRATION_SENSOR_INIT_POLL_MS 10
 
 // Minimum samples before attempting trial calibration
-#define MAG_CAL_MIN_SAMPLES 60
+#define MAG_CAL_MIN_SAMPLES 192
 // Attempt trial calibration every this many new samples (manual cal)
-#define MAG_CAL_TRIAL_INTERVAL 80
-// Minimum new samples between online calibration checks
-// Higher than manual to reduce oscillation from repeated small updates
-#define MAG_CAL_ONLINE_CHECK_INTERVAL 100
+#define MAG_CAL_TRIAL_INTERVAL (MAG_CAL_MIN_SAMPLES / 2)
 
 static int64_t mag_cal_last_status_log;
 
 static double ata[100]; // manual calibration accumulator
 static double norm_sum;
 static double sample_count;
-// Direction diversity tracking: sum of normalized mag directions
-static float dir_sum[3];
 // Direction range tracking for manual calibration: per-axis min/max of normalized direction
 static float dir_min[3];
 static float dir_max[3];
+// Per-axis min/max center estimator used only for coverage decisions.
+// Magneto still receives raw samples so the hard/soft-iron fit is unchanged.
+typedef struct {
+	float min[3];
+	float max[3];
+	bool initialized;
+} mag_center_estimator_t;
+
+static mag_center_estimator_t manual_center_estimator;
+static mag_center_estimator_t online_center_estimator;
 // Minimum direction range per axis for accepting manual calibration
 // 0.5 ≈ 30° arc on each axis; requires meaningful rotation around at least 2 axes
 #define MAG_CAL_MIN_DIR_RANGE 0.5f
+// Do not use a provisional min/max center until the raw point cloud spans a
+// meaningful range on every axis. Without this, tiny local motion around a
+// biased field can look like full centered coverage and produce a huge-gain fit.
+#define MAG_CAL_MIN_RAW_AXIS_RANGE 0.5f
+// Reject degenerate Magneto fits that turn a tiny point cloud into a sphere by
+// applying a very large soft-iron gain. Normal calibrated gains are around 1-3.
+#define MAG_CAL_MAX_AXIS_GAIN 8.0f
+
+// Per-quadrant ring buffer for online magnetometer calibration.
+// Combines the directional coverage guarantee of quadrant-based sampling
+// (8 octants based on sign of x, y, z) with the natural aging of FIFO
+// per-quadrant sliding windows. Each octant independently wraps after
+// QUADRANT_BUF_SIZE samples — staying in one orientation only updates
+// that octant, leaving the other 7 with diverse data.
+#define QUADRANT_BUF_SIZE 32
+#define ONLINE_QUADRANT_COUNT 8
+#define ONLINE_BUFFER_SAMPLE_CAPACITY (ONLINE_QUADRANT_COUNT * QUADRANT_BUF_SIZE)
 
 typedef struct {
-	double ata[100];
-	double norm_sum;
-	double sample_count;
-	float dir_sum[3];
-} online_mag_window_t;
+	float x, y, z;
+} quadrant_sample_t;
 
-// Online calibration keeps only recent data so the fitter can recover after
-// strong-field disturbances or magnetic hysteresis instead of being poisoned by
-// unbounded history forever.
-#define ONLINE_WINDOW_SEGMENTS 2
-#define ONLINE_WINDOW_SEGMENT_SAMPLES 80
-#define ONLINE_WINDOW_MAX_SAMPLES (ONLINE_WINDOW_SEGMENTS * ONLINE_WINDOW_SEGMENT_SAMPLES)
+typedef struct {
+	quadrant_sample_t samples[QUADRANT_BUF_SIZE];
+	uint8_t head;   // next write position
+	uint8_t count;  // valid samples (0..QUADRANT_BUF_SIZE)
+	int64_t last_seq; // global accepted-sample sequence of the newest sample in this octant
+} quadrant_buf_t;
 
-static online_mag_window_t online_windows[ONLINE_WINDOW_SEGMENTS];
-static uint8_t online_window_head;
+// Incremental calibration blending (EMA on BAinv elements)
+// Base alpha: weight given to new trial calibration. A value of 0.35 means
+// 35% new + 65% existing → gradual convergence over ~3 updates.
+// Higher when trial diverges significantly from existing (environment change).
+#define ONLINE_BLEND_BASE_ALPHA 0.35f
+#define ONLINE_BLEND_MIN_ALPHA 0.12f   // floor: very similar calibrations
+#define ONLINE_BLEND_MAX_ALPHA 0.70f   // ceiling: significant divergence detected
+#define ONLINE_BLEND_SIMILARITY_LOW 0.85f   // below this similarity, increase alpha
+#define ONLINE_BLEND_SIMILARITY_HIGH 0.97f  // above this similarity, use min alpha
+
+static quadrant_buf_t quad_buf[ONLINE_QUADRANT_COUNT];
 static int64_t online_total_sample_count;
-static int64_t online_last_check_count; // total accepted online samples at last trial check
+static int64_t online_last_checked_sample_count;
+static int64_t online_last_check_time;
 static int64_t online_last_sample_time; // rate limiting
+// Drop octants that have not been refreshed for too long.
+// This is kept separate from the check cadence: stale-history rejection should
+// not depend on how often the background thread decides to run Magneto.
+#define ONLINE_STALE_QUADRANT_MAX_AGE (ONLINE_BUFFER_SAMPLE_CAPACITY * 5 / 2)
 // Minimum direction change to accept an online sample. The configured value is
 // expressed in degrees and converted to the equivalent 1 - cos(theta) threshold.
 static float online_last_dir[3];
+static float online_last_accel_dir[3]; // accel direction for cross-validation
+
+// Manual calibration direction tracking (same cross-validation logic as online path)
+static float manual_last_dir[3];
+static float manual_last_accel_dir[3];
+
 #define ONLINE_MIN_DIR_CHANGE_DEG 10.0f
 #define ONLINE_MIN_INTERVAL_MS 30  // minimum 30ms between online samples
+// Background checks should not run on every calibration-thread pass.
+// Tie the minimum check spacing to roughly one fresh fit's worth of accepted
+// samples at the maximum online sampling rate.
+#define ONLINE_MIN_CHECK_INTERVAL_MS (ONLINE_BUFFER_SAMPLE_CAPACITY * ONLINE_MIN_INTERVAL_MS)
 
 // Runtime calibrated norm tracking (exponential moving average)
 // Used to assess current calibration quality and decide if online update is needed
@@ -114,11 +169,40 @@ static float cal_norm_var_ema;    // EMA of squared deviation from mean
 static uint32_t cal_norm_count;   // number of norm samples processed
 #define CAL_NORM_EMA_ALPHA 0.01f  // smoothing factor (~100 sample window)
 // Don't update calibration if current norm CV is below this threshold
-#define CAL_NORM_GOOD_CV 0.07f    // 7% = good enough calibration
+#define CAL_NORM_GOOD_CV 0.05f    // 5% = good enough calibration
 
 // Minimum time between online calibration updates (prevents frequent VQF mag ref resets)
-#define ONLINE_MIN_UPDATE_INTERVAL_S 10  // 10 seconds cooldown
+#define ONLINE_MIN_UPDATE_INTERVAL_S 6  // 6 seconds cooldown
 static int64_t online_last_update_time;
+static bool sensor_calibration_online_mag_enabled_from_retained(void);
+
+// Suppress online sample collection for N ms after buffer resets (wake-up,
+// reboot, environment change, calibration update).  This lets sensor data
+// stabilise before collecting, avoiding transient/mixed-environment samples
+// that produce poor calibration fits.
+#define ONLINE_COLLECTION_SUPPRESS_MS 1500
+static int64_t online_collection_suppress_until;
+
+// Minimum sustained VQF magnetic disturbance duration before allowing an online
+// calibration update.  Short disturbance bursts are usually transient interference;
+// updating calibration during those resets VQF's heading reference for no benefit.
+#define ONLINE_VQF_DIST_MIN_DURATION_MS 3000
+static int64_t online_vqf_dist_start_time;
+
+// Require at least N successful calibration updates before trusting the
+// norm CV gate. Prevents a single early fit from being declared "good enough"
+// when the buffer is still filling and directional coverage is incomplete.
+#define ONLINE_MIN_UPDATES 3
+static int online_update_count;
+
+// Norm-change detection: when the average raw field strength in the buffer
+// changes by >40% between updates, the magnetic environment has changed.
+// We clear buffers to avoid mixed-data fits and let the next cycle fit
+// on consistent data from the new environment.
+static float online_last_buf_avg_norm = 0.0f;
+
+static void magneto_online_runtime_reset(void);
+static void magneto_online_runtime_load_retained(void);
 
 // #define DEBUG true
 
@@ -142,6 +226,9 @@ static void sensor_calibrate_imu(void);
 static void sensor_calibrate_6_side(void);
 #endif
 static int sensor_calibrate_mag(void);
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+static void sensor_calibrate_sens(void);
+#endif
 
 // =============================================================================
 // Offset-bias collection constants
@@ -493,12 +580,25 @@ static bool wait_for_motion(bool motion, int samples);
 static void magneto_reset(void);
 static void magneto_online_clear_history(void);
 static void magneto_online_reset(void);
-static void magneto_online_advance_window(void);
-static double magneto_online_collect_recent(double ata_out[100], double *norm_sum_out, float dir_sum_out[3]);
+static double magneto_online_recent_center(mag_center_estimator_t *center);
+static double magneto_online_collect_recent(double ata_out[100], double *norm_sum_out,
+                                            float dir_sum_out[3], float *raw_range_out);
 static int magneto_online_recent_sample_count(void);
 static float magneto_online_recent_dir_bias(void);
 static float magneto_online_min_dir_change_threshold(void);
 static float magneto_directional_bias(const float ds[3], double count);
+static void magneto_center_reset(mag_center_estimator_t *estimator);
+static void magneto_center_update(mag_center_estimator_t *estimator, const float m[3]);
+static void magneto_center_get(const mag_center_estimator_t *estimator, float center[3]);
+static float magneto_center_min_range(const mag_center_estimator_t *estimator);
+static bool magneto_center_has_coverage(const mag_center_estimator_t *estimator);
+static void magneto_centered_sample(const mag_center_estimator_t *estimator, const float m[3], float centered[3]);
+static void magneto_coverage_sample(const mag_center_estimator_t *estimator, const float m[3], float coverage_sample[3]);
+static float magneto_norm_sq(const float v[3]);
+static bool magneto_normalize_direction(const float v[3], float dir[3]);
+static bool magneto_centered_direction(const mag_center_estimator_t *estimator, const float m[3], float dir[3]);
+static void magneto_accumulate_direction(float ds[3], const float v[3]);
+static void magneto_update_dir_range(const float v[3]);
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 static int isAccRest(float *, float *, float, int *, int);
 #endif
@@ -634,6 +734,67 @@ uint8_t *sensor_calibration_get_sensor_data()
 	return sensor_data;
 }
 
+static void magneto_online_runtime_load_retained(void)
+{
+	magneto_online_reset();
+	online_update_count = retained->onlineMagState.update_count;
+	online_last_buf_avg_norm = retained->onlineMagState.last_buf_avg_norm;
+}
+
+static bool sensor_calibration_online_mag_enabled_from_retained(void)
+{
+	return retained->mag_online_calibration_mode != MAG_ONLINE_CALIBRATION_DISABLED;
+}
+
+bool sensor_calibration_get_online_mag_enabled(void)
+{
+	return sensor_calibration_online_mag_enabled_from_retained();
+}
+
+void sensor_calibration_set_online_mag_enabled(bool enabled)
+{
+	uint8_t mode = enabled ? MAG_ONLINE_CALIBRATION_ENABLED : MAG_ONLINE_CALIBRATION_DISABLED;
+
+	if (sensor_calibration_get_online_mag_enabled() == enabled &&
+	    retained->mag_online_calibration_mode == mode) {
+		LOG_INF("Online mag calibration already %s", enabled ? "enabled" : "disabled");
+		return;
+	}
+
+	magneto_online_runtime_reset();
+	if (!enabled) {
+		sensor_calibration_online_mag_retained_clear();
+	}
+	sys_write(
+		MAG_ONLINE_CALIBRATION_ID,
+		&retained->mag_online_calibration_mode,
+		&mode,
+		sizeof(mode)
+	);
+	LOG_INF("Online mag calibration %s (persisted)", enabled ? "enabled" : "disabled");
+}
+
+void sensor_calibration_online_mag_retained_save(void)
+{
+	if (!sensor_calibration_get_online_mag_enabled()) {
+		sensor_calibration_online_mag_retained_clear();
+		return;
+	}
+	retained->onlineMagState.update_count = (uint8_t)CLAMP(online_update_count, 0, 255);
+	retained->onlineMagState.last_buf_avg_norm = online_last_buf_avg_norm;
+}
+
+void sensor_calibration_online_mag_retained_clear(void)
+{
+	memset(&retained->onlineMagState, 0, sizeof(retained->onlineMagState));
+}
+
+void sensor_calibration_online_mag_cold_start(void)
+{
+	magneto_online_runtime_reset();
+	sensor_calibration_online_mag_retained_clear();
+}
+
 void sensor_calibration_read(void)
 {
 	memcpy(sensor_data, retained->sensor_data, sizeof(sensor_data));
@@ -642,6 +803,27 @@ void sensor_calibration_read(void)
 	memcpy(magBias, retained->magBias, sizeof(magBias));
 	memcpy(magBAinv, retained->magBAinv, sizeof(magBAinv));
 	memcpy(accBAinv, retained->accBAinv, sizeof(accBAinv));
+	if (retained->mag_online_calibration_mode > MAG_ONLINE_CALIBRATION_DISABLED) {
+		retained->mag_online_calibration_mode = MAG_ONLINE_CALIBRATION_DEFAULT;
+	}
+	LOG_INF(
+		"Online mag calibration: %s",
+		sensor_calibration_get_online_mag_enabled() ? "enabled" : "disabled"
+	);
+	if (sensor_calibration_get_online_mag_enabled()) {
+		float zero[3] = {0};
+		if (v_diff_mag(magBAinv[0], zero) != 0) {
+			magneto_online_runtime_load_retained();
+			if (online_update_count > 0 || cal_norm_count > 0) {
+				LOG_INF("Online mag runtime restored (%d updates, %u norm samples)",
+				        online_update_count, cal_norm_count);
+			}
+		} else {
+			magneto_online_runtime_reset();
+		}
+	} else {
+		magneto_online_runtime_reset();
+	}
 #if CONFIG_SENSOR_USE_TCAL
 	tcal_compensation_enabled = retained->tcal_enabled;
 	LOG_INF("T-Cal compensation: %s", tcal_compensation_enabled ? "enabled" : "disabled");
@@ -706,12 +888,14 @@ int sensor_calibration_validate_mag(float m_inv[][3], bool write)
 	}
 	float magnitude = v_avg(diagonal);
 	float average[3] = {magnitude, magnitude, magnitude};
-	if (!v_epsilon(m_inv[0], zero, 1)
+	float max_gain = MAX(MAX(fabsf(diagonal[0]), fabsf(diagonal[1])), fabsf(diagonal[2]));
+	if (!v_epsilon(m_inv[0], zero, magnitude * 2.0f)
 		|| !v_epsilon(
 			diagonal,
 			average,
 			MAX(magnitude * 0.2f, 0.1f)
-		)) // check offset is <1 unit and diagonals are within 20%
+		)
+		|| max_gain > MAG_CAL_MAX_AXIS_GAIN) // check offset, diagonal spread, and reject huge-gain fits
 	{
 		sensor_calibration_clear_mag(m_inv, write);
 		LOG_WRN("Invalidated calibration");
@@ -769,12 +953,17 @@ void sensor_calibration_clear_6_side(float a_inv[][3], bool write)
 
 void sensor_calibration_clear_mag(float m_inv[][3], bool write)
 {
+	bool clearing_live_state = (m_inv == NULL || m_inv == magBAinv);
 	if (m_inv == NULL) {
 		m_inv = magBAinv;
 	}
 	memset(m_inv, 0, sizeof(magBAinv)); // zeroed matrix will disable magnetometer in fusion
+	if (clearing_live_state) {
+		magneto_online_runtime_reset();
+	}
 	if (write) {
 		LOG_INF("Clearing stored calibration data");
+		sensor_calibration_online_mag_retained_clear();
 		sys_write(MAIN_MAG_BIAS_ID, &retained->magBAinv, m_inv, sizeof(magBAinv));
 		sensor_refresh_sensor_ids(); // Refresh reported mag status after clear
 	}
@@ -789,6 +978,28 @@ void sensor_request_calibration(void)
 void sensor_request_calibration_6_side(void)
 {
 	sensor_calibration_request(2);
+}
+#endif
+
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+int sensor_request_calibration_sens(uint8_t axis, uint16_t revolutions)
+{
+	if (axis > 2 || revolutions == 0) {
+		return -1;
+	}
+
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	if (requested_calibration != 0) {
+		k_mutex_unlock(&calibration_request_lock);
+		LOG_ERR("Sensor calibration is already running");
+		return -1;
+	}
+
+	sens_cal_axis = axis;
+	sens_cal_revolutions = revolutions;
+	requested_calibration = 5;
+	k_mutex_unlock(&calibration_request_lock);
+	return 0;
 }
 #endif
 
@@ -1319,7 +1530,7 @@ static int sensor_calibrate_mag(void)
 	} else {
 		LOG_INF("Applying calibration");
 		memcpy(magBAinv, m_inv, sizeof(magBAinv));
-		magneto_online_reset();  // Restart online accumulation with new baseline
+		magneto_online_runtime_reset();  // Restart online calibration from a clean baseline
 #if CONFIG_SENSOR_USE_VQF
 		vqf_reset_mag_ref();
 		sensor_mag_ref_reset(); // Recompute magRef from new calibration
@@ -1336,6 +1547,298 @@ static int sensor_calibrate_mag(void)
 	}
 	return 0;
 }
+
+// =============================================================================
+// Gyro sensitivity (scale-factor) calibration
+// =============================================================================
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+// The user spins the tracker a known number of full revolutions about a single
+// axis. We integrate the measured gyro rate over that motion and compare the
+// measured angle against the true angle to derive a per-axis scale factor that
+// corrects cumulative over- or under-rotation.
+#define SENS_CAL_BIAS_SAMPLE_MS   1000   // In-situ bias averaging window
+#define SENS_CAL_START_RATE_DPS   30.0f  // Rate that counts as "spin started"
+#define SENS_CAL_STOP_RATE_DPS    10.0f  // Rate that counts as "spin stopped"
+#define SENS_CAL_STOP_DWELL_MS    1000   // Rate must stay low this long to stop
+#define SENS_CAL_START_TIMEOUT_MS 30000  // Give up waiting for the spin to start
+#define SENS_CAL_SPIN_TIMEOUT_MS  60000  // Give up waiting for the spin to finish
+#define SENS_CAL_MIN_FRACTION     0.85f  // Require near-complete expected angle before stopping
+#define SENS_CAL_MIN_SCALE        0.9f   // Reject implausible results (likely wrong turn count)
+#define SENS_CAL_MAX_SCALE        1.1f
+#define SENS_CAL_WARN_OFF_AXIS_RATIO 0.10f
+#define SENS_CAL_MAX_OFF_AXIS_RATIO 0.25f
+
+static void sensor_calibrate_sens(void)
+{
+	uint8_t axis = sens_cal_axis;
+	uint16_t revolutions = sens_cal_revolutions;
+
+	if (axis > 2 || revolutions == 0) {
+		LOG_ERR("Sensitivity calibration: invalid parameters");
+		printk("Gyro sensitivity auto-calibration failed: invalid parameters.\n");
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		return;
+	}
+	char axis_char = "XYZ"[axis];
+	float expected_deg = 360.0f * revolutions;
+
+	LOG_INF(
+		"Sensitivity calibration: axis %c, %u rev (%.1f deg expected)",
+		axis_char,
+		revolutions,
+		(double)expected_deg
+	);
+
+	float g[3];
+
+	// 1. Wait for the tracker to be held still before measuring bias.
+	set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_SENSOR);
+	LOG_INF("Sensitivity calibration: hold still");
+	if (!wait_for_motion(false, 6)) {
+		LOG_WRN("Sensitivity calibration: tracker not still, aborting");
+		printk("Gyro sensitivity auto-calibration failed: tracker was not still.\n");
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		return;
+	}
+
+	// 2. Measure the in-situ gyro bias. sensor_wait_gyro returns
+	//    raw samples (before bias and sensitivity are applied), so we average a
+	//    short window here rather than relying on the stored gyro bias.
+	double bias_sum[3] = {0.0, 0.0, 0.0};
+	int bias_count = 0;
+	int64_t bias_start = k_uptime_get();
+	while (k_uptime_get() - bias_start < SENS_CAL_BIAS_SAMPLE_MS) {
+		if (sensor_wait_gyro(g, K_MSEC(1000))) {
+			LOG_WRN("Sensitivity calibration: gyro timeout during bias, aborting");
+			printk("Gyro sensitivity auto-calibration failed: gyro timeout while measuring bias.\n");
+			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+			return;
+		}
+		for (int i = 0; i < 3; i++) {
+			bias_sum[i] += (double)g[i];
+		}
+		bias_count++;
+		watchdog_feed(WDT_CHANNEL_CALIBRATION);
+	}
+	if (bias_count == 0) {
+		LOG_WRN("Sensitivity calibration: no bias samples, aborting");
+		printk("Gyro sensitivity auto-calibration failed: no bias samples.\n");
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		return;
+	}
+	float gyro_bias[3];
+	for (int i = 0; i < 3; i++) {
+		gyro_bias[i] = (float)(bias_sum[i] / bias_count);
+	}
+	LOG_INF(
+		"Sensitivity calibration: bias %.4f %.4f %.4f dps",
+		(double)gyro_bias[0],
+		(double)gyro_bias[1],
+		(double)gyro_bias[2]
+	);
+
+	// 3. Arm and wait for the user to start spinning. FLASH means "ready, spin now".
+	set_led(SYS_LED_PATTERN_FLASH, SYS_LED_PRIORITY_SENSOR);
+	LOG_INF("Sensitivity calibration: spin the tracker about the %c axis now", axis_char);
+	int64_t arm_start = k_uptime_get();
+	int64_t last_wdt = arm_start;
+	float rate = 0.0f;
+	while (true) {
+		if (k_uptime_get() - arm_start >= SENS_CAL_START_TIMEOUT_MS) {
+			LOG_WRN("Sensitivity calibration: no spin detected, aborting");
+			printk("Gyro sensitivity auto-calibration failed: no spin detected.\n");
+			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+			return;
+		}
+		if (sensor_wait_gyro(g, K_MSEC(1000))) {
+			continue; // Tolerate occasional waits while watching for the start
+		}
+		rate = g[axis] - gyro_bias[axis];
+		if (k_uptime_get() - last_wdt >= 1000) {
+			watchdog_feed(WDT_CHANNEL_CALIBRATION);
+			last_wdt = k_uptime_get();
+		}
+		if (fabsf(rate) > SENS_CAL_START_RATE_DPS) {
+			break;
+		}
+	}
+
+	// 4. Integrate the gyro rate over the spin. ON indicates recording.
+	//    sensor_wait_gyro returns only the most recent sample, so crediting each
+	//    observed sample a fixed 1/ODR step would silently drop the rotation from
+	//    any samples produced while this loop was busy and undercount the spin.
+	//    Integrate against the real elapsed time between samples instead (as the
+	//    fusion path does with its measured time step); each observed sample then
+	//    covers the true interval since the previous one, which also tolerates the
+	//    sensor's actual sample rate differing from its nominal ODR.
+	set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_SENSOR);
+	LOG_INF("Sensitivity calibration: recording");
+	double measured = 0.0;
+	double axis_motion = 0.0;
+	double off_axis_motion = 0.0;
+	int64_t spin_start = k_uptime_get();
+	int64_t last_ticks = k_uptime_ticks();
+	int64_t below_since = -1; // When the rate first dropped below the stop threshold
+	bool finished = false;
+	last_wdt = spin_start;
+	while (k_uptime_get() - spin_start < SENS_CAL_SPIN_TIMEOUT_MS) {
+		if (sensor_wait_gyro(g, K_MSEC(1000))) {
+			LOG_WRN("Sensitivity calibration: gyro timeout during spin, aborting");
+			printk("Gyro sensitivity auto-calibration failed: gyro timeout during spin.\n");
+			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+			return;
+		}
+		int64_t now_ticks = k_uptime_ticks();
+		double dt = (double)k_ticks_to_us_near64(now_ticks - last_ticks) * 1e-6;
+		last_ticks = now_ticks;
+
+		rate = g[axis] - gyro_bias[axis];
+		measured += (double)rate * dt;
+		axis_motion += fabs((double)rate) * dt;
+		double off_axis_rate_sq = 0.0;
+		for (int i = 0; i < 3; i++) {
+			if (i != axis) {
+				double off_rate = (double)(g[i] - gyro_bias[i]);
+				off_axis_rate_sq += off_rate * off_rate;
+			}
+		}
+		off_axis_motion += sqrt(off_axis_rate_sq) * dt;
+
+		if (k_uptime_get() - last_wdt >= 1000) {
+			watchdog_feed(WDT_CHANNEL_CALIBRATION);
+			last_wdt = k_uptime_get();
+		}
+
+		// The spin is complete once the rate stays low for the dwell time, but only
+		// after at least a minimum fraction of the expected angle has been covered.
+		// This keeps a brief pause mid-spin from ending the measurement early.
+		if (fabsf(rate) < SENS_CAL_STOP_RATE_DPS &&
+		    fabs(measured) >= (double)(expected_deg * SENS_CAL_MIN_FRACTION)) {
+			if (below_since < 0) {
+				below_since = k_uptime_get();
+			} else if (k_uptime_get() - below_since >= SENS_CAL_STOP_DWELL_MS) {
+				finished = true;
+				break;
+			}
+		} else {
+			below_since = -1;
+		}
+	}
+
+	if (!finished) {
+		LOG_WRN("Sensitivity calibration: spin did not complete in time, aborting");
+		printk("Gyro sensitivity auto-calibration failed: spin did not complete in time.\n");
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		return;
+	}
+
+	float measured_deg = (float)fabs(measured);
+	if (measured_deg < 1e-3f) {
+		LOG_WRN("Sensitivity calibration: measured angle too small, aborting");
+		printk("Gyro sensitivity auto-calibration failed: measured angle too small.\n");
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		return;
+	}
+
+	// Want measured_deg * scale == expected_deg, independent of rotation direction.
+	float scale = expected_deg / measured_deg;
+	float over_rotation = measured_deg - expected_deg;
+	float off_axis_ratio = axis_motion > 1e-3 ? (float)(off_axis_motion / axis_motion) : 1.0f;
+	float equivalent_diff_deg = (1.0f - (1.0f / scale)) * (360.0f * CONFIG_SENSOR_SENS_REV);
+	LOG_INF(
+		"Sensitivity calibration: measured %.2f deg, expected %.2f deg, over-rotation %.2f deg, off-axis %.3f",
+		(double)measured_deg,
+		(double)expected_deg,
+		(double)over_rotation,
+		(double)off_axis_ratio
+	);
+	LOG_INF("Sensitivity calibration: computed scale %.5f", (double)scale);
+
+	if (!isfinite(scale)) {
+		LOG_WRN("Sensitivity calibration: computed non-finite scale, not applied");
+		printk("Gyro sensitivity auto-calibration rejected: invalid scale. Nothing saved.\n");
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		return;
+	}
+
+	if (off_axis_ratio > SENS_CAL_MAX_OFF_AXIS_RATIO) {
+		LOG_WRN(
+			"Sensitivity calibration: off-axis ratio %.3f above %.3f, not applied",
+			(double)off_axis_ratio,
+			(double)SENS_CAL_MAX_OFF_AXIS_RATIO
+		);
+		printk(
+			"Gyro sensitivity auto-calibration rejected: too much off-axis motion (%.2f > %.2f). Nothing saved.\n",
+			(double)off_axis_ratio,
+			(double)SENS_CAL_MAX_OFF_AXIS_RATIO
+		);
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		return;
+	}
+
+	// Reject implausible results. The firmware cannot distinguish a wrong revolution
+	// count from a genuinely large sensitivity error, so a scale far from 1.0 most
+	// likely means the wrong number of turns was performed.
+	if (scale < SENS_CAL_MIN_SCALE || scale > SENS_CAL_MAX_SCALE) {
+		LOG_WRN(
+			"Sensitivity calibration: scale %.5f out of range [%.2f, %.2f], not applied",
+			(double)scale,
+			(double)SENS_CAL_MIN_SCALE,
+			(double)SENS_CAL_MAX_SCALE
+		);
+		printk(
+			"Gyro sensitivity auto-calibration rejected: measured %.2f deg for %.2f deg, scale %.5f outside %.2f..%.2f. Equivalent sens diff over %u rev: %.3f deg. Nothing saved.\n",
+			(double)measured_deg,
+			(double)expected_deg,
+			(double)scale,
+			(double)SENS_CAL_MIN_SCALE,
+			(double)SENS_CAL_MAX_SCALE,
+			(unsigned int)CONFIG_SENSOR_SENS_REV,
+			(double)equivalent_diff_deg
+		);
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		return;
+	}
+
+	if (!retained) {
+		LOG_ERR("Sensitivity calibration: retained data unavailable, not applied");
+		printk("Gyro sensitivity auto-calibration failed: retained data unavailable.\n");
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		return;
+	}
+
+	retained->gyroSensScale[axis] = scale;
+	retained_update();
+	sys_write(
+		MAIN_GYRO_SENS_ID,
+		&retained->gyroSensScale,
+		retained->gyroSensScale,
+		sizeof(retained->gyroSensScale)
+	);
+
+	LOG_INF("Sensitivity calibration: axis %c scale set to %.5f", axis_char, (double)scale);
+	if (off_axis_ratio > SENS_CAL_WARN_OFF_AXIS_RATIO) {
+		printk(
+			"Gyro sensitivity auto-calibration saved: axis %c, scale %.5f, equivalent sens diff over %u rev: %.3f deg, off-axis %.2f. Axis alignment was loose; repeating may improve accuracy.\n",
+			axis_char,
+			(double)scale,
+			(unsigned int)CONFIG_SENSOR_SENS_REV,
+			(double)equivalent_diff_deg,
+			(double)off_axis_ratio
+		);
+	} else {
+		printk(
+			"Gyro sensitivity auto-calibration saved: axis %c, scale %.5f, equivalent sens diff over %u rev: %.3f deg, off-axis %.2f.\n",
+			axis_char,
+			(double)scale,
+			(unsigned int)CONFIG_SENSOR_SENS_REV,
+			(double)equivalent_diff_deg,
+			(double)off_axis_ratio
+		);
+	}
+	set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_SENSOR);
+}
+#endif
 
 // TODO: isAccRest
 static bool wait_for_motion(bool motion, int samples)
@@ -1377,11 +1880,13 @@ static void magneto_reset(void)
 	memset(ata, 0, sizeof(ata));
 	norm_sum = 0;
 	sample_count = 0;
-	memset(dir_sum, 0, sizeof(dir_sum));
 	for (int i = 0; i < 3; i++) {
 		dir_min[i] = 2.0f;   // start high
 		dir_max[i] = -2.0f;  // start low
 	}
+	magneto_center_reset(&manual_center_estimator);
+	memset(manual_last_dir, 0, sizeof(manual_last_dir));
+	memset(manual_last_accel_dir, 0, sizeof(manual_last_accel_dir));
 }
 
 static void magneto_online_reset(void)
@@ -1391,36 +1896,86 @@ static void magneto_online_reset(void)
 	online_last_update_time = 0;
 }
 
+static void magneto_online_runtime_reset(void)
+{
+	magneto_online_reset();
+	online_update_count = 0;
+	online_last_buf_avg_norm = 0.0f;
+	cal_norm_count = 0;
+	cal_norm_ema = 0.0f;
+	cal_norm_var_ema = 0.0f;
+}
+
 static void magneto_online_clear_history(void)
 {
-	memset(online_windows, 0, sizeof(online_windows));
-	online_window_head = 0;
+	memset(quad_buf, 0, sizeof(quad_buf));
 	online_total_sample_count = 0;
-	online_last_check_count = 0;
+	online_last_checked_sample_count = 0;
+	online_last_check_time = 0;
 	memset(online_last_dir, 0, sizeof(online_last_dir));
+	memset(online_last_accel_dir, 0, sizeof(online_last_accel_dir));
+	magneto_center_reset(&online_center_estimator);
+	// Suppress collection for a few seconds so transient/stale samples from
+	// wake-up, reboot, or environment transitions are not mixed into the
+	// fresh buffer.
+	online_collection_suppress_until = k_uptime_get() + ONLINE_COLLECTION_SUPPRESS_MS;
 }
 
-static void magneto_online_advance_window(void)
+static bool magneto_online_quadrant_is_recent(const quadrant_buf_t *qbuf)
 {
-	online_window_head = (online_window_head + 1) % ONLINE_WINDOW_SEGMENTS;
-	memset(&online_windows[online_window_head], 0, sizeof(online_windows[online_window_head]));
+	if (qbuf->count == 0) {
+		return false;
+	}
+	return (online_total_sample_count - qbuf->last_seq) <= ONLINE_STALE_QUADRANT_MAX_AGE;
 }
 
-static double magneto_online_collect_recent(double ata_out[100], double *norm_sum_out, float dir_sum_out[3])
+static double magneto_online_recent_center(mag_center_estimator_t *center)
+{
+	magneto_center_reset(center);
+
+	double count = 0;
+	for (int q = 0; q < ONLINE_QUADRANT_COUNT; q++) {
+		if (!magneto_online_quadrant_is_recent(&quad_buf[q])) {
+			continue;
+		}
+		for (int i = 0; i < quad_buf[q].count; i++) {
+			quadrant_sample_t *s = &quad_buf[q].samples[i];
+			float m[3] = {s->x, s->y, s->z};
+			magneto_center_update(center, m);
+			count++;
+		}
+	}
+
+	return count;
+}
+
+// Collect all valid samples from all 8 quadrant ring buffers.
+// Recomputes ATA, norm_sum, centered dir_sum, and raw min/max range from raw samples.
+static double magneto_online_collect_recent(double ata_out[100], double *norm_sum_out,
+                                            float dir_sum_out[3], float *raw_range_out)
 {
 	memset(ata_out, 0, sizeof(double) * 100);
 	*norm_sum_out = 0;
 	memset(dir_sum_out, 0, sizeof(float) * 3);
 
-	double recent_sample_count = 0;
-	for (int i = 0; i < ONLINE_WINDOW_SEGMENTS; i++) {
-		recent_sample_count += online_windows[i].sample_count;
-		*norm_sum_out += online_windows[i].norm_sum;
-		for (int j = 0; j < 100; j++) {
-			ata_out[j] += online_windows[i].ata[j];
+	mag_center_estimator_t recent_center;
+	double recent_sample_count = magneto_online_recent_center(&recent_center);
+	if (raw_range_out) {
+		*raw_range_out = magneto_center_min_range(&recent_center);
+	}
+
+	double fit_sample_count = 0;
+	for (int q = 0; q < ONLINE_QUADRANT_COUNT; q++) {
+		if (!magneto_online_quadrant_is_recent(&quad_buf[q])) {
+			continue;
 		}
-		for (int axis = 0; axis < 3; axis++) {
-			dir_sum_out[axis] += online_windows[i].dir_sum[axis];
+		for (int i = 0; i < quad_buf[q].count; i++) {
+			quadrant_sample_t *s = &quad_buf[q].samples[i];
+			magneto_sample((double)s->x, (double)s->y, (double)s->z, ata_out, norm_sum_out, &fit_sample_count);
+			float raw[3] = {s->x, s->y, s->z};
+			float coverage_sample[3];
+			magneto_coverage_sample(&recent_center, raw, coverage_sample);
+			magneto_accumulate_direction(dir_sum_out, coverage_sample);
 		}
 	}
 	return recent_sample_count;
@@ -1428,22 +1983,32 @@ static double magneto_online_collect_recent(double ata_out[100], double *norm_su
 
 static int magneto_online_recent_sample_count(void)
 {
-	int recent_sample_count = 0;
-	for (int i = 0; i < ONLINE_WINDOW_SEGMENTS; i++) {
-		recent_sample_count += (int)online_windows[i].sample_count;
+	int count = 0;
+	for (int q = 0; q < ONLINE_QUADRANT_COUNT; q++) {
+		if (!magneto_online_quadrant_is_recent(&quad_buf[q])) {
+			continue;
+		}
+		count += quad_buf[q].count;
 	}
-	return recent_sample_count;
+	return count;
 }
 
 static float magneto_online_recent_dir_bias(void)
 {
 	float dir_sum_recent[3] = {0};
-	double recent_sample_count = 0;
+	mag_center_estimator_t recent_center;
+	double recent_sample_count = magneto_online_recent_center(&recent_center);
 
-	for (int i = 0; i < ONLINE_WINDOW_SEGMENTS; i++) {
-		recent_sample_count += online_windows[i].sample_count;
-		for (int axis = 0; axis < 3; axis++) {
-			dir_sum_recent[axis] += online_windows[i].dir_sum[axis];
+	for (int q = 0; q < ONLINE_QUADRANT_COUNT; q++) {
+		if (!magneto_online_quadrant_is_recent(&quad_buf[q])) {
+			continue;
+		}
+		for (int i = 0; i < quad_buf[q].count; i++) {
+			quadrant_sample_t *s = &quad_buf[q].samples[i];
+			float raw[3] = {s->x, s->y, s->z};
+			float coverage_sample[3];
+			magneto_coverage_sample(&recent_center, raw, coverage_sample);
+			magneto_accumulate_direction(dir_sum_recent, coverage_sample);
 		}
 	}
 
@@ -1481,13 +2046,89 @@ static float magneto_directional_bias(const float ds[3], double count)
 }
 
 /**
- * Accumulate a normalized direction for diversity tracking.
+ * Update a min/max hard-iron center estimate for coverage calculations.
  */
-static void magneto_accumulate_direction(float ds[3], float mx, float my, float mz)
+static void magneto_center_reset(mag_center_estimator_t *estimator)
 {
-	float norm_sq = mx * mx + my * my + mz * mz;
-	if (norm_sq < 1e-8f) {
+	memset(estimator, 0, sizeof(*estimator));
+}
+
+static void magneto_center_update(mag_center_estimator_t *estimator, const float m[3])
+{
+	if (!estimator->initialized) {
+		memcpy(estimator->min, m, sizeof(estimator->min));
+		memcpy(estimator->max, m, sizeof(estimator->max));
+		estimator->initialized = true;
 		return;
+	}
+
+	for (int i = 0; i < 3; i++) {
+		if (m[i] < estimator->min[i]) { estimator->min[i] = m[i]; }
+		if (m[i] > estimator->max[i]) { estimator->max[i] = m[i]; }
+	}
+}
+
+static void magneto_center_get(const mag_center_estimator_t *estimator, float center[3])
+{
+	if (!estimator->initialized) {
+		memset(center, 0, sizeof(float) * 3);
+		return;
+	}
+
+	for (int i = 0; i < 3; i++) {
+		center[i] = (estimator->min[i] + estimator->max[i]) * 0.5f;
+	}
+}
+
+static float magneto_center_min_range(const mag_center_estimator_t *estimator)
+{
+	if (!estimator->initialized) {
+		return 0.0f;
+	}
+
+	float min_range = estimator->max[0] - estimator->min[0];
+	for (int i = 1; i < 3; i++) {
+		float range = estimator->max[i] - estimator->min[i];
+		if (range < min_range) {
+			min_range = range;
+		}
+	}
+	return min_range;
+}
+
+static bool magneto_center_has_coverage(const mag_center_estimator_t *estimator)
+{
+	return magneto_center_min_range(estimator) >= MAG_CAL_MIN_RAW_AXIS_RANGE;
+}
+
+static void magneto_centered_sample(const mag_center_estimator_t *estimator, const float m[3], float centered[3])
+{
+	float center[3];
+	magneto_center_get(estimator, center);
+	for (int i = 0; i < 3; i++) {
+		centered[i] = m[i] - center[i];
+	}
+}
+
+static void magneto_coverage_sample(const mag_center_estimator_t *estimator, const float m[3], float coverage_sample[3])
+{
+	if (magneto_center_has_coverage(estimator)) {
+		magneto_centered_sample(estimator, m, coverage_sample);
+	} else {
+		memcpy(coverage_sample, m, sizeof(float) * 3);
+	}
+}
+
+static float magneto_norm_sq(const float v[3])
+{
+	return v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+}
+
+static bool magneto_normalize_direction(const float v[3], float dir[3])
+{
+	float norm_sq = magneto_norm_sq(v);
+	if (norm_sq < 1e-8f) {
+		return false;
 	}
 #if CONFIG_CMSIS_DSP
 	float norm;
@@ -1496,29 +2137,51 @@ static void magneto_accumulate_direction(float ds[3], float mx, float my, float 
 #else
 	float inv_norm = 1.0f / sqrtf(norm_sq);
 #endif
-	ds[0] += mx * inv_norm;
-	ds[1] += my * inv_norm;
-	ds[2] += mz * inv_norm;
+	dir[0] = v[0] * inv_norm;
+	dir[1] = v[1] * inv_norm;
+	dir[2] = v[2] * inv_norm;
+	return true;
+}
+
+static bool magneto_centered_direction(const mag_center_estimator_t *estimator, const float m[3], float dir[3])
+{
+	float centered[3];
+	if (magneto_center_has_coverage(estimator)) {
+		magneto_centered_sample(estimator, m, centered);
+		if (magneto_normalize_direction(centered, dir)) {
+			return true;
+		}
+	}
+
+	// First sample, or a sample very near the provisional center: keep the old
+	// raw-direction fallback so calibration can bootstrap.
+	return magneto_normalize_direction(m, dir);
+}
+
+/**
+ * Accumulate a normalized direction for diversity tracking.
+ */
+static void magneto_accumulate_direction(float ds[3], const float v[3])
+{
+	float dir[3];
+	if (!magneto_normalize_direction(v, dir)) {
+		return;
+	}
+	ds[0] += dir[0];
+	ds[1] += dir[1];
+	ds[2] += dir[2];
 }
 
 /**
  * Update direction range tracking (min/max per axis of normalized direction).
  * Used only by manual calibration to ensure sufficient multi-axis rotation.
  */
-static void magneto_update_dir_range(float mx, float my, float mz)
+static void magneto_update_dir_range(const float v[3])
 {
-	float norm_sq = mx * mx + my * my + mz * mz;
-	if (norm_sq < 1e-8f) {
+	float d[3];
+	if (!magneto_normalize_direction(v, d)) {
 		return;
 	}
-#if CONFIG_CMSIS_DSP
-	float norm;
-	arm_sqrt_f32(norm_sq, &norm);
-	float inv_norm = 1.0f / norm;
-#else
-	float inv_norm = 1.0f / sqrtf(norm_sq);
-#endif
-	float d[3] = {mx * inv_norm, my * inv_norm, mz * inv_norm};
 	for (int i = 0; i < 3; i++) {
 		if (d[i] < dir_min[i]) { dir_min[i] = d[i]; }
 		if (d[i] > dir_max[i]) { dir_max[i] = d[i]; }
@@ -1568,8 +2231,11 @@ static bool magneto_quality_check(double *ata_buf, double norm_sum_val, double s
 	}
 	float magnitude = v_avg(diagonal);
 	float average[3] = {magnitude, magnitude, magnitude};
-	if (!v_epsilon(m_inv[0], zero, 1)
-	    || !v_epsilon(diagonal, average, MAX(magnitude * 0.2f, 0.1f))) {
+	float max_gain = MAX(MAX(fabsf(diagonal[0]), fabsf(diagonal[1])), fabsf(diagonal[2]));
+	float hm = (float)(norm_sum_val / sample_count_val);
+	if (!v_epsilon(m_inv[0], zero, hm * 2.0f)
+	    || !v_epsilon(diagonal, average, MAX(magnitude * 0.2f, 0.1f))
+	    || max_gain > MAG_CAL_MAX_AXIS_GAIN) {
 		return false;
 	}
 
@@ -1577,6 +2243,120 @@ static bool magneto_quality_check(double *ata_buf, double norm_sum_val, double s
 		memcpy(m_inv_out, m_inv, sizeof(m_inv));
 	}
 	return true;
+}
+
+/**
+ * Compute similarity between two BAinv calibration matrices.
+ * Uses normalized Frobenius norm: similarity = 1.0 - ||candidate - existing|| / ||existing||.
+ * Returns 1.0 for identical calibrations, approaching 0 for very different ones.
+ * The offset row (row 0) and soft-iron rows (1-3) contribute equally to the norm.
+ */
+static float magneto_BAinv_similarity(float existing[4][3], float candidate[4][3])
+{
+	float diff_norm_sq = 0;
+	float existing_norm_sq = 0;
+
+	for (int r = 0; r < 4; r++) {
+		for (int c = 0; c < 3; c++) {
+			float d = candidate[r][c] - existing[r][c];
+			diff_norm_sq += d * d;
+			existing_norm_sq += existing[r][c] * existing[r][c];
+		}
+	}
+
+	if (existing_norm_sq < 1e-12f) {
+		// Existing calibration is near-zero (identity): treat as low similarity
+		return 0.0f;
+	}
+
+	float similarity = 1.0f - sqrtf(diff_norm_sq / existing_norm_sq);
+	if (similarity < 0.0f) { similarity = 0.0f; }
+	if (similarity > 1.0f) { similarity = 1.0f; }
+	return similarity;
+}
+
+/**
+ * Blend two BAinv calibrations using exponential moving average (EMA).
+ * blended = (1 - alpha) * existing + alpha * candidate
+ * Alpha is computed from similarity: more similar → lower alpha (conservative),
+ * more different → higher alpha (adaptive to environmental change).
+ *
+ * The blended result is validated with the same structural checks as
+ * magneto_quality_check. If blending produces an invalid result, the
+ * candidate is used directly (fallback to full replacement).
+ *
+ * Returns true if the blend (or fallback) is valid, false if both are invalid.
+ */
+static bool magneto_blend_BAinv(float out[4][3], float existing[4][3],
+                                float candidate[4][3])
+{
+	float similarity = magneto_BAinv_similarity(existing, candidate);
+
+	// Compute adaptive blending weight
+	float alpha;
+	if (similarity >= ONLINE_BLEND_SIMILARITY_HIGH) {
+		// Very similar: candidate is just a minor refinement → low alpha
+		alpha = ONLINE_BLEND_MIN_ALPHA;
+	} else if (similarity <= ONLINE_BLEND_SIMILARITY_LOW) {
+		// Significant divergence (possible environment change) → high alpha
+		alpha = ONLINE_BLEND_MAX_ALPHA;
+	} else {
+		// Linear interpolation between low and high thresholds
+		float t = (similarity - ONLINE_BLEND_SIMILARITY_LOW)
+		        / (ONLINE_BLEND_SIMILARITY_HIGH - ONLINE_BLEND_SIMILARITY_LOW);
+		alpha = ONLINE_BLEND_MAX_ALPHA
+		      + t * (ONLINE_BLEND_MIN_ALPHA - ONLINE_BLEND_MAX_ALPHA);
+	}
+
+	// Blend
+	float blended[4][3];
+	float one_minus_alpha = 1.0f - alpha;
+	for (int r = 0; r < 4; r++) {
+		for (int c = 0; c < 3; c++) {
+			blended[r][c] = one_minus_alpha * existing[r][c]
+			              + alpha * candidate[r][c];
+		}
+	}
+
+	// Validate blended result
+	float zero[3] = {0};
+	float diagonal[3];
+	for (int i = 0; i < 3; i++) {
+		diagonal[i] = blended[i + 1][i];
+	}
+	float magnitude = v_avg(diagonal);
+	float average[3] = {magnitude, magnitude, magnitude};
+	float max_gain = MAX(MAX(fabsf(diagonal[0]), fabsf(diagonal[1])), fabsf(diagonal[2]));
+	if (v_epsilon(blended[0], zero, 1)
+	    && v_epsilon(diagonal, average, MAX(magnitude * 0.2f, 0.1f))
+	    && max_gain <= MAG_CAL_MAX_AXIS_GAIN) {
+		// Blended result is valid
+		memcpy(out, blended, sizeof(blended));
+		return true;
+	}
+
+	// Fallback: use candidate directly if blend is invalid.
+	// Candidate was already validated by magneto_quality_check before this call,
+	// so validate with its own diagonal here for consistency.
+	{
+		float c_diag[3];
+		for (int i = 0; i < 3; i++) {
+			c_diag[i] = candidate[i + 1][i];
+		}
+		float c_avg = v_avg(c_diag);
+		float c_avg_arr[3] = {c_avg, c_avg, c_avg};
+		float c_max_gain = MAX(MAX(fabsf(c_diag[0]), fabsf(c_diag[1])), fabsf(c_diag[2]));
+		if (v_epsilon(candidate[0], zero, 1)
+		    && v_epsilon(c_diag, c_avg_arr, MAX(c_avg * 0.2f, 0.1f))
+		    && c_max_gain <= MAG_CAL_MAX_AXIS_GAIN) {
+			memcpy(out, candidate, sizeof(float) * 4 * 3);
+			return true;
+		}
+	}
+
+	// Both blend and fallback invalid — should not happen since candidate was
+	// already validated by magneto_quality_check before calling this function
+	return false;
 }
 
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
@@ -2058,20 +2838,88 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 // Accumulates into ATA and periodically runs trial calibration for quality check.
 static void sensor_sample_mag_magneto_sample(const float m[3])
 {
+	// Direction diversity gate: accept sample if either mag direction OR
+	// accelerometer (gravity) direction has changed since last accepted.
+	// Identical logic to the online path — breaks direction lock-in during
+	// magnetic interference by cross-validating with physical orientation.
+	//
+	// Gate accelerometer by magnitude as well: skip the direction check
+	// entirely when the device is under strong linear acceleration, falling
+	// back to mag-only for that sample.
+	float accel_mag_sq = aBuf[0] * aBuf[0] + aBuf[1] * aBuf[1] + aBuf[2] * aBuf[2];
+	bool accel_trustworthy = (accel_mag_sq >= MAG_CAL_ACCEL_MAG_MIN_SQ
+	                       && accel_mag_sq <= MAG_CAL_ACCEL_MAG_MAX_SQ);
+
+	float raw_mag[3] = {m[0], m[1], m[2]};
+	float cur_mag_dir[3];
+	if (magneto_norm_sq(raw_mag) < 1e-8f) {
+		return;
+	}
+	magneto_center_update(&manual_center_estimator, raw_mag);
+	if (!magneto_centered_direction(&manual_center_estimator, raw_mag, cur_mag_dir)) {
+		return;
+	}
+
+	// Normalize accelerometer (if trustworthy)
+	float cur_accel_dir[3] = {0};
+	if (accel_trustworthy) {
+		float accel_inv = 1.0f / sqrtf(accel_mag_sq);
+		cur_accel_dir[0] = aBuf[0] * accel_inv;
+		cur_accel_dir[1] = aBuf[1] * accel_inv;
+		cur_accel_dir[2] = aBuf[2] * accel_inv;
+	}
+
+	if (sample_count > 0) {
+		float min_change = magneto_online_min_dir_change_threshold();
+
+		// Mag direction change
+		float mag_dot = cur_mag_dir[0] * manual_last_dir[0]
+		              + cur_mag_dir[1] * manual_last_dir[1]
+		              + cur_mag_dir[2] * manual_last_dir[2];
+		bool mag_changed = (1.0f - mag_dot >= min_change);
+
+		// Accel direction change (only if accel is trustworthy)
+		bool accel_changed = false;
+		if (accel_trustworthy) {
+			float accel_dot = cur_accel_dir[0] * manual_last_accel_dir[0]
+			                + cur_accel_dir[1] * manual_last_accel_dir[1]
+			                + cur_accel_dir[2] * manual_last_accel_dir[2];
+			accel_changed = (1.0f - accel_dot >= min_change);
+		}
+
+		// Accept only if at least one direction source shows movement
+		if (!mag_changed && !accel_changed) {
+			return; // redundant sample
+		}
+	}
+
+	// Update last accepted directions
+	manual_last_dir[0] = cur_mag_dir[0];
+	manual_last_dir[1] = cur_mag_dir[1];
+	manual_last_dir[2] = cur_mag_dir[2];
+	if (accel_trustworthy) {
+		manual_last_accel_dir[0] = cur_accel_dir[0];
+		manual_last_accel_dir[1] = cur_accel_dir[1];
+		manual_last_accel_dir[2] = cur_accel_dir[2];
+	}
+
 	// Accept sample - add to Magneto accumulator
 	magneto_sample(m[0], m[1], m[2], ata, &norm_sum, &sample_count); // 400us
-	magneto_accumulate_direction(dir_sum, m[0], m[1], m[2]);
-	magneto_update_dir_range(m[0], m[1], m[2]);
+	float coverage_mag[3];
+	magneto_coverage_sample(&manual_center_estimator, raw_mag, coverage_mag);
+	magneto_update_dir_range(coverage_mag);
 
 	// Attempt trial calibration every MAG_CAL_TRIAL_INTERVAL samples
 	if (sample_count >= MAG_CAL_MIN_SAMPLES &&
 	    (int)sample_count % MAG_CAL_TRIAL_INTERVAL < 1) {
 		float min_range = magneto_min_dir_range();
-		LOG_INF("Mag cal check: %d samples, min_range=%.2f (need %.2f)",
-		        (int)sample_count, (double)min_range, (double)MAG_CAL_MIN_DIR_RANGE);
+		float raw_range = magneto_center_min_range(&manual_center_estimator);
+		LOG_INF("Mag cal check: %d samples, min_range=%.2f (need %.2f), raw_range=%.3f (need %.3f)",
+		        (int)sample_count, (double)min_range, (double)MAG_CAL_MIN_DIR_RANGE,
+		        (double)raw_range, (double)MAG_CAL_MIN_RAW_AXIS_RANGE);
 
 		// Require minimum directional coverage before attempting calibration
-		if (min_range < MAG_CAL_MIN_DIR_RANGE) {
+		if (min_range < MAG_CAL_MIN_DIR_RANGE || raw_range < MAG_CAL_MIN_RAW_AXIS_RANGE) {
 			LOG_INF("Mag cal: need more rotation, keep turning");
 			set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_SENSOR);
 			return;
@@ -2095,29 +2943,64 @@ static void sensor_sample_mag_magneto_sample(const float m[3])
 // Gated by: VQF disturbance detection, accel magnitude, time interval, and direction change.
 void sensor_calibration_online_mag_sample(const float m[3])
 {
+	if (!sensor_calibration_get_online_mag_enabled()) {
+		return;
+	}
+
 	// Don't accumulate during manual calibration
 	if (magneto_progress & 0x80) {
+		return;
+	}
+
+	int64_t now = k_uptime_get();
+
+	// Track VQF disturbance duration (before any sample gates) so the
+	// background check function knows how long disturbance has persisted.
+#if CONFIG_SENSOR_USE_VQF
+	if (vqf_get_mag_dist_detected()) {
+		if (online_vqf_dist_start_time == 0) {
+			online_vqf_dist_start_time = now;
+		}
+	} else {
+		online_vqf_dist_start_time = 0;
+	}
+#endif
+
+	// Suppress collection after buffer resets (wake-up, reboot, environment
+	// change, calibration update) to let sensor data stabilise.
+	if (now < online_collection_suppress_until) {
 		return;
 	}
 
 	// Reject if VQF detects magnetic disturbance (only when we have an existing
 	// calibration — VQF only receives mag data when calibrated, so mag_dist_detected
 	// is meaningless without calibration).
-	// Exception: if current calibration quality is bad (norm CV > 10%), the disturbance
+	// Exception 1: if current calibration quality is bad (norm CV > 6%), the disturbance
 	// detection itself may be unreliable due to the bad calibration, so skip the gate.
+	// Exception 2: if VQF has been reporting disturbance continuously for a long time,
+	// the "disturbance" is likely a calibration drift or environment change rather than
+	// transient interference.  Allow samples through to enable recalibration.
+	// Without this, a deadlock occurs: VQF reports disturbance → gate blocks samples →
+	// cal_norm_count stops updating (guarded by !magDistDetected in sensor.c) → CV
+	// stays frozen at a low value → gate never opens → no recalibration possible.
 #if CONFIG_SENSOR_USE_VQF
 	{
 		float zero[3] = {0};
 		bool has_cal = (v_diff_mag(magBAinv[0], zero) != 0);
 		float current_cv = sensor_calibration_get_mag_quality();
-		if (has_cal && current_cv < 0.10f && vqf_get_mag_dist_detected()) {
-			return;
+		if (has_cal && current_cv < 0.06f && vqf_get_mag_dist_detected()) {
+			// Sustained disturbance override: if disturbance has persisted for
+			// more than 5 seconds, allow samples through.
+			bool sustained = (online_vqf_dist_start_time > 0 &&
+			                  (now - online_vqf_dist_start_time) > 5000);
+			if (!sustained) {
+				return;
+			}
 		}
 	}
 #endif
 
 	// Rate limit: minimum interval between samples
-	int64_t now = k_uptime_get();
 	if (now - online_last_sample_time < ONLINE_MIN_INTERVAL_MS) {
 		return;
 	}
@@ -2128,27 +3011,43 @@ void sensor_calibration_online_mag_sample(const float m[3])
 		return;
 	}
 
-	// Direction diversity gate: only accept if mag direction changed enough
-	float norm_sq = m[0] * m[0] + m[1] * m[1] + m[2] * m[2];
-	if (norm_sq < 1e-8f) {
+	// Direction diversity gate: accept sample if either mag direction OR
+	// accelerometer (gravity) direction has changed since last accepted sample.
+	// Pure magnetometer-based direction check can suffer from "direction lock-in"
+	// during strong magnetic interference: the mag reading points to a distorted
+	// but stable direction while the tracker physically rotates.  The accelerometer
+	// cross-check breaks this deadlock — if the device has physically moved
+	// (accel direction changed), accept the sample regardless of mag direction.
+	float raw_mag[3] = {m[0], m[1], m[2]};
+	float cur_dir[3];
+	if (magneto_norm_sq(raw_mag) < 1e-8f) {
 		return;
 	}
-#if CONFIG_CMSIS_DSP
-	float norm;
-	arm_sqrt_f32(norm_sq, &norm);
-	float inv_norm = 1.0f / norm;
-#else
-	float inv_norm = 1.0f / sqrtf(norm_sq);
-#endif
-	float cur_dir[3] = {m[0] * inv_norm, m[1] * inv_norm, m[2] * inv_norm};
+	magneto_center_update(&online_center_estimator, raw_mag);
+	if (!magneto_centered_direction(&online_center_estimator, raw_mag, cur_dir)) {
+		return;
+	}
 
-	// Check direction change from last accepted sample
+	// Normalize accelerometer to get gravity direction
+	// aBuf magnitude already validated (~1g) by the accel gate above
+	float accel_norm = sqrtf(accel_mag_sq);
+	float accel_inv = 1.0f / accel_norm;
+	float cur_accel_dir[3] = {aBuf[0] * accel_inv, aBuf[1] * accel_inv, aBuf[2] * accel_inv};
+
 	if (online_total_sample_count > 0) {
-		float dot = cur_dir[0] * online_last_dir[0]
-		          + cur_dir[1] * online_last_dir[1]
-		          + cur_dir[2] * online_last_dir[2];
-		if (1.0f - dot < magneto_online_min_dir_change_threshold()) {
-			return; // direction hasn't changed enough
+		float mag_dot = cur_dir[0] * online_last_dir[0]
+		              + cur_dir[1] * online_last_dir[1]
+		              + cur_dir[2] * online_last_dir[2];
+		float accel_dot = cur_accel_dir[0] * online_last_accel_dir[0]
+		                + cur_accel_dir[1] * online_last_accel_dir[1]
+		                + cur_accel_dir[2] * online_last_accel_dir[2];
+
+		float min_change = magneto_online_min_dir_change_threshold();
+		bool mag_changed = (1.0f - mag_dot >= min_change);
+		bool accel_changed = (1.0f - accel_dot >= min_change);
+
+		if (!mag_changed && !accel_changed) {
+			return; // neither mag nor accel direction changed enough
 		}
 	}
 
@@ -2156,48 +3055,168 @@ void sensor_calibration_online_mag_sample(const float m[3])
 	online_last_dir[0] = cur_dir[0];
 	online_last_dir[1] = cur_dir[1];
 	online_last_dir[2] = cur_dir[2];
+	online_last_accel_dir[0] = cur_accel_dir[0];
+	online_last_accel_dir[1] = cur_accel_dir[1];
+	online_last_accel_dir[2] = cur_accel_dir[2];
 
-	online_mag_window_t *window = &online_windows[online_window_head];
-	magneto_sample(m[0], m[1], m[2], window->ata, &window->norm_sum, &window->sample_count);
-	magneto_accumulate_direction(window->dir_sum, m[0], m[1], m[2]);
+	float route_mag[3];
+	magneto_coverage_sample(&online_center_estimator, raw_mag, route_mag);
+	if (magneto_norm_sq(route_mag) < 1e-8f) {
+		memcpy(route_mag, raw_mag, sizeof(route_mag));
+	}
+
+	// Route sample to its octant based on sign relative to the min/max center.
+	// This guarantees each octant independently rolls its ring buffer,
+	// preventing a single orientation from evicting diverse data in other octants.
+	int octant = 0;
+	if (route_mag[0] < 0) octant |= 1;
+	if (route_mag[1] < 0) octant |= 2;
+	if (route_mag[2] < 0) octant |= 4;
+
+	quadrant_buf_t *qbuf = &quad_buf[octant];
 	online_total_sample_count++;
-
-	if (window->sample_count >= ONLINE_WINDOW_SEGMENT_SAMPLES) {
-		magneto_online_advance_window();
+	qbuf->last_seq = online_total_sample_count;
+	qbuf->samples[qbuf->head].x = m[0];
+	qbuf->samples[qbuf->head].y = m[1];
+	qbuf->samples[qbuf->head].z = m[2];
+	qbuf->head = (qbuf->head + 1) % QUADRANT_BUF_SIZE;
+	if (qbuf->count < QUADRANT_BUF_SIZE) {
+		qbuf->count++;
 	}
 }
 
 static bool sensor_calibration_online_mag_check(void)
 {
-	if (online_total_sample_count < MAG_CAL_MIN_SAMPLES) {
-		return false;
-	}
-	if (online_total_sample_count - online_last_check_count < MAG_CAL_ONLINE_CHECK_INTERVAL) {
+	if (!sensor_calibration_get_online_mag_enabled()) {
 		return false;
 	}
 
-	online_last_check_count = online_total_sample_count;
+	int recent_sample_count_now = magneto_online_recent_sample_count();
+	int64_t now = k_uptime_get();
+
+	if (recent_sample_count_now < MAG_CAL_MIN_SAMPLES) {
+		return false;
+	}
+	if (online_total_sample_count == online_last_checked_sample_count) {
+		return false;
+	}
+	if (online_last_check_time > 0 &&
+	    (now - online_last_check_time) < ONLINE_MIN_CHECK_INTERVAL_MS) {
+		return false;
+	}
+
+	online_last_checked_sample_count = online_total_sample_count;
+	online_last_check_time = now;
 
 	float zero[3] = {0};
 	bool has_existing = (v_diff_mag(magBAinv[0], zero) != 0);
 	float current_cv = has_existing ? sensor_calibration_get_mag_quality() : 1.0f;
 
-	// If the current calibration is already good enough, skip the heavy Magneto fit.
-	// The old path still solved first and only then decided to skip, which could take
-	// tens of milliseconds and interfere with sensor FIFO servicing.
-	if (has_existing && current_cv < CAL_NORM_GOOD_CV) {
-		return false;
+	// When VQF has a reliable calibration (CV < 4%) and is NOT experiencing
+	// sustained magnetic disturbance, skip the calibration check entirely.
+	// Updating calibration resets VQF's mag reference (vqf_reset_mag_ref),
+	// causing ~6s of heading instability.  Only attempt a recalibration
+	// when VQF has been detecting disturbance for >3 seconds, indicating
+	// the current calibration is genuinely insufficient.
+#if CONFIG_SENSOR_USE_VQF
+	if (has_existing && current_cv < 0.04f) {
+		if (online_vqf_dist_start_time == 0) {
+			return false; // VQF not disturbed — current cal is fine
+		}
+		int64_t dist_duration_ms = now - online_vqf_dist_start_time;
+		if (dist_duration_ms < ONLINE_VQF_DIST_MIN_DURATION_MS) {
+			return false; // transient disturbance — wait
+		}
+	}
+#endif
+
+	// If the current calibration is already good enough AND we've had enough
+	// updates to trust that assessment, skip the heavy Magneto fit.
+	//
+	// Two-tier convergence:
+	//   Tier 1 (strict): CV is good AND directional coverage is adequate
+	//     → require low dir_bias (sphere sampled evenly)
+	//   Tier 2 (relaxed): CV is excellent AND we've done many updates
+	//     → trust the fit regardless of dir_bias (directional fluctuations
+	//       during normal rotation are just sampling noise, not real problems)
+	//
+	// Exception: skip convergence checks when VQF is experiencing sustained
+	// magnetic disturbance.  The CV value is frozen during disturbance (norm
+	// tracking gated by !magDistDetected in sensor.c), so a low frozen CV
+	// does NOT mean the calibration is still good — the environment may have
+	// changed.  If the code reached here past the CV < 4% disturbance gate
+	// above, the disturbance is sustained and recalibration should proceed.
+#if CONFIG_SENSOR_USE_VQF
+	bool vqf_sustained_dist = (online_vqf_dist_start_time > 0 &&
+	                           (now - online_vqf_dist_start_time) > ONLINE_VQF_DIST_MIN_DURATION_MS);
+#else
+	bool vqf_sustained_dist = false;
+#endif
+	if (has_existing && current_cv < CAL_NORM_GOOD_CV && online_update_count >= ONLINE_MIN_UPDATES
+	    && !vqf_sustained_dist) {
+		// Tier 2: Excellent fit + sufficient history — lock it in.
+		// CV < 0.035 and 3+ updates mean the calibration has reliably
+		// converged.  Further updates would only add noise.
+		if (current_cv < 0.035f && online_update_count >= 3) {
+			LOG_INF("Online mag cal: converged (cv=%.3f, %d updates)",
+			        (double)current_cv, online_update_count);
+			return false;
+		}
+
+		float dir_bias_check = magneto_online_recent_dir_bias();
+
+		// Tier 1: Good fit with adequate directional coverage
+		if (dir_bias_check < 0.10f) {
+			LOG_INF("Online mag cal: skipping (cv=%.3f < %.3f, dir_bias=%.3f, %d updates)",
+			        (double)current_cv, (double)CAL_NORM_GOOD_CV,
+			        (double)dir_bias_check, online_update_count);
+			return false;
+		}
+		// Directional bias still too high: buffer samples are clustered.
+		// Fall through to run calibration even though CV looks good.
+		LOG_INF("Online mag cal: CV ok but dir_bias=%.3f >= 0.10, continuing",
+		        (double)dir_bias_check);
 	}
 
 	double ata_recent[100];
 	double recent_norm_sum;
 	float recent_dir_sum[3];
-	double recent_sample_count = magneto_online_collect_recent(ata_recent, &recent_norm_sum, recent_dir_sum);
+	float recent_raw_range;
+	double recent_sample_count = magneto_online_collect_recent(ata_recent, &recent_norm_sum,
+	                                                           recent_dir_sum, &recent_raw_range);
 	if (recent_sample_count < MAG_CAL_MIN_SAMPLES) {
 		return false;
 	}
+	if (recent_raw_range < MAG_CAL_MIN_RAW_AXIS_RANGE) {
+		LOG_INF("Online mag cal: need more rotation (raw_range=%.3f < %.3f, %d recent samples)",
+		        (double)recent_raw_range, (double)MAG_CAL_MIN_RAW_AXIS_RANGE,
+		        (int)recent_sample_count);
+		return false;
+	}
+
+	// Detect magnetic environment changes by comparing the buffer's
+	// average raw field strength against the last update's reference.
+	// When the norm changes by >25% (e.g., moving between a desk and
+	// a high-interference area), clear buffers to prevent mixed-data
+	// fits.  Direction is preserved — only scale changes.
+	float buf_avg_norm = (float)(recent_norm_sum / recent_sample_count);
+
+	if (has_existing && online_update_count > 0 && online_last_buf_avg_norm > 0.0f) {
+		float norm_ratio = buf_avg_norm / online_last_buf_avg_norm;
+		if (norm_ratio > 1.25f || norm_ratio < 0.80f) {
+			LOG_WRN("Online mag cal: env change detected (buf norm %.3f -> %.3f, ratio %.2f), "
+			        "resetting buffers",
+			        (double)online_last_buf_avg_norm, (double)buf_avg_norm, (double)norm_ratio);
+			magneto_online_clear_history();
+			online_update_count = 0;
+			online_last_buf_avg_norm = 0.0f;
+			return false;
+		}
+	}
 
 	float dbias = magneto_directional_bias(recent_dir_sum, recent_sample_count);
+	LOG_INF("Online mag cal: coverage raw_range=%.3f, dir_bias=%.3f, n=%d",
+	        (double)recent_raw_range, (double)dbias, (int)recent_sample_count);
 
 	// Quality check: directional diversity + validation + compute calibration
 	float m_inv[4][3];
@@ -2206,8 +3225,10 @@ static bool sensor_calibration_online_mag_check(void)
 		        (int)recent_sample_count, (double)dbias);
 		return false;
 	}
-
-	int64_t now = k_uptime_get();
+	if (!sensor_calibration_get_online_mag_enabled()) {
+		LOG_INF("Online mag cal: disabled before apply, skipping update");
+		return false;
+	}
 
 	if (has_existing) {
 		// Enforce minimum cooldown between updates to avoid frequent VQF mag ref resets.
@@ -2217,31 +3238,90 @@ static bool sensor_calibration_online_mag_check(void)
 			return false;
 		}
 
-		LOG_INF("Online mag cal: updating (%d recent samples, dir_bias=%.3f, current_cv=%.3f)",
-		        (int)recent_sample_count, (double)dbias, (double)current_cv);
+		// Blend trial calibration with existing using EMA.
+		// Blending weight is similarity-adaptive: more similar → conservative,
+		// more divergent → faster adaptation (possible environment change).
+		float blended[4][3];
+		if (!magneto_blend_BAinv(blended, magBAinv, m_inv)) {
+			LOG_WRN("Online mag cal: blend validation failed, skipping update");
+			return false;
+		}
+
+		float similarity = magneto_BAinv_similarity(magBAinv, m_inv);
+
+		// Reject candidate if similarity is below threshold — the data
+		// is too inconsistent for a meaningful fit.  This guards against
+		// mixed-data fits (e.g. when the tracker moves between magnetic
+		// environments and the quadrant buffer holds samples from both old
+		// and new locations).
+		// Rather than blindly trusting a poor fit, let the buffer age out
+		// stale samples; the next cycle will fit a consistent dataset with
+		// much higher similarity.
+		//
+		// Exception: during the first ONLINE_MIN_UPDATES cycles we accept
+		// even low-sim fits to establish an initial baseline (especially
+		// important when booting with a stale NVS calibration).
+		if (similarity < 0.85f) {
+			if (online_update_count < ONLINE_MIN_UPDATES) {
+				LOG_INF("Online mag cal: low sim=%.3f accepted (early bootstrap #%d)",
+				        (double)similarity, online_update_count + 1);
+			} else if (current_cv < CAL_NORM_GOOD_CV) {
+				LOG_WRN("Online mag cal: rejecting candidate (sim=%.3f < 0.85, "
+				        "current cv=%.3f is good — possible mixed data)",
+				        (double)similarity, (double)current_cv);
+				return false;
+			} else {
+				LOG_WRN("Online mag cal: rejecting candidate (sim=%.3f < 0.85, "
+				        "current cv=%.3f — incomplete/dirty buffer?)",
+				        (double)similarity, (double)current_cv);
+				return false;
+			}
+		}
+
+		LOG_INF("Online mag cal: blended (#%d, %d samples, dir_bias=%.3f, cur_cv=%.3f, sim=%.3f)",
+		        online_update_count + 1,
+		        (int)recent_sample_count, (double)dbias, (double)current_cv,
+		        (double)similarity);
+		memcpy(magBAinv, blended, sizeof(magBAinv));
+		memcpy(m_inv, blended, sizeof(m_inv)); // for logging below
+
+		// Start the next cycle from a clean buffer. Keeping pre-update samples
+		// around can immediately re-mix old field conditions into the next fit.
+		magneto_online_clear_history();
+		online_last_update_time = now;
+		online_update_count++;
+		online_last_buf_avg_norm = buf_avg_norm;
+
+		// Reset VQF mag reference so it re-establishes with the refined calibration
+#if CONFIG_SENSOR_USE_VQF
+		vqf_reset_mag_ref();
+		sensor_mag_ref_reset();
+#endif
 	} else {
 		LOG_INF("Online mag cal: first calibration (%d recent samples, dir_bias=%.3f)",
 		        (int)recent_sample_count, (double)dbias);
-	}
 
-	// Accept new calibration
-	memcpy(magBAinv, m_inv, sizeof(magBAinv));
-	sys_write(MAIN_MAG_BIAS_ID, &retained->magBAinv, magBAinv, sizeof(magBAinv));
-	sensor_refresh_sensor_ids();
-	magneto_online_clear_history();
-	online_last_update_time = now;
+		// First calibration: use candidate directly
+		memcpy(magBAinv, m_inv, sizeof(magBAinv));
+		magneto_online_clear_history();
+		online_last_update_time = now;
+		online_update_count = 1;
+		online_last_buf_avg_norm = buf_avg_norm;
 
-	// Reset VQF mag reference so it re-establishes with the new calibration
-	// This avoids VQF entering disturbance rejection mode due to the calibration change
+		// Reset VQF mag reference so it re-establishes with the new calibration
 #if CONFIG_SENSOR_USE_VQF
-	vqf_reset_mag_ref();
-	sensor_mag_ref_reset(); // Recompute magRef from new calibration
+		vqf_reset_mag_ref();
+		sensor_mag_ref_reset();
 #endif
+	}
 
 	// Reset norm tracking after calibration change
 	cal_norm_count = 0;
 	cal_norm_ema = 0;
 	cal_norm_var_ema = 0;
+
+	sys_write(MAIN_MAG_BIAS_ID, &retained->magBAinv, magBAinv, sizeof(magBAinv));
+	sensor_refresh_sensor_ids();
 
 	LOG_INF("Online mag cal applied:");
 	for (int i = 0; i < 3; i++) {
@@ -2255,6 +3335,12 @@ static bool sensor_calibration_online_mag_check(void)
 
 int sensor_calibration_online_mag_status(float *dir_bias)
 {
+	if (!sensor_calibration_get_online_mag_enabled()) {
+		if (dir_bias) {
+			*dir_bias = 1.0f;
+		}
+		return 0;
+	}
 	if (dir_bias) {
 		*dir_bias = magneto_online_recent_dir_bias();
 	}
@@ -2265,6 +3351,9 @@ int sensor_calibration_online_mag_status(float *dir_bias)
 // Called from sensor.c after applying BAinv calibration.
 void sensor_calibration_track_mag_norm(float cal_norm)
 {
+	if (!sensor_calibration_get_online_mag_enabled()) {
+		return;
+	}
 	if (cal_norm < 1e-6f) {
 		return;
 	}
@@ -2292,21 +3381,29 @@ float sensor_calibration_get_mag_quality(void)
 
 static int sensor_calibration_request(int id)
 {
-	static int requested = 0;
+	int result;
+
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
 	switch (id) {
 	case -1:
-		requested = 0;
-		return 0;
+		requested_calibration = 0;
+		result = 0;
+		break;
 	case 0:
-		return requested;
+		result = requested_calibration;
+		break;
 	default:
-		if (requested != 0) {
+		if (requested_calibration != 0) {
 			LOG_ERR("Sensor calibration is already running");
-			return -1;
+			result = -1;
+		} else {
+			requested_calibration = id;
+			result = 0;
 		}
-		requested = id;
-		return 0;
+		break;
 	}
+	k_mutex_unlock(&calibration_request_lock);
+	return result;
 }
 
 static void calibration_thread(void)
@@ -2316,25 +3413,27 @@ static void calibration_thread(void)
 
 	sensor_calibration_read();
 
-#if CONFIG_SENSOR_USE_TCAL
-	// Wait for sensor to be initialized before building LUT
-	// This prevents issues when sensor fails to initialize
-	int init_wait_count = 0;
-	while (!sensor_is_initialized()) {
+	// Startup validation and T-Cal LUT build require live sensor state.
+	// If no IMU was detected, keep the retained values as-is and avoid
+	// reporting missing hardware as corrupted calibration.
+	bool sensor_ready = sensor_is_initialized();
+	int64_t init_wait_start = k_uptime_get();
+	while (!sensor_ready) {
 		watchdog_feed(WDT_CHANNEL_CALIBRATION);
-		k_msleep(100);
-		init_wait_count++;
-		// Timeout after 10 seconds to avoid infinite loop if sensor never initializes
-		if (init_wait_count >= 100) {
-			LOG_WRN("T-Cal: Timeout waiting for sensor initialization, skipping LUT build");
+		k_msleep(CALIBRATION_SENSOR_INIT_POLL_MS);
+		sensor_ready = sensor_is_initialized();
+		if (!sensor_ready &&
+		    k_uptime_get() - init_wait_start >= CALIBRATION_SENSOR_INIT_WAIT_MS) {
+			LOG_INF("Sensor not initialized; skipping startup calibration validation");
 			break;
 		}
 	}
 
+#if CONFIG_SENSOR_USE_TCAL
 	// Build LUT at startup if T-Cal data is available and sensor is initialized
 	// LUT is only in RAM and needs to be rebuilt after every boot
 	// Use incremental build: priority zone first, then background completion
-	if (sensor_is_initialized() && retained->tempCalState.count >= MLS_MIN_POINTS_FOR_FIT) {
+	if (sensor_ready && retained->tempCalState.count >= MLS_MIN_POINTS_FOR_FIT) {
 		// Validate tempCalState.count to prevent issues with corrupted retained data
 		if (retained->tempCalState.count > TCAL_BUFFER_SIZE) {
 			LOG_ERR("T-Cal: Invalid point count %u (max %d), resetting",
@@ -2358,12 +3457,16 @@ static void calibration_thread(void)
 	// TODO: start and run thread from request?
 	// TODO: replace wait_for_motion with isAccRest
 
-	// Verify calibrations
-	sensor_calibration_validate(NULL, NULL, true);
+	// Verify calibrations only after the sensor stack is initialized.
+	if (sensor_ready) {
+		sensor_calibration_validate(NULL, NULL, true);
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-	sensor_calibration_validate_6_side(NULL, true);
+		sensor_calibration_validate_6_side(NULL, true);
 #endif
-	sensor_calibration_validate_mag(NULL, true);
+		if (sensor_get_mag_available()) {
+			sensor_calibration_validate_mag(NULL, true);
+		}
+	}
 
 	// requested calibrations run here
 	while (1) {
@@ -2393,6 +3496,14 @@ static void calibration_thread(void)
 		case 4: // Runtime periodic calibration
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
 			sensor_perform_runtime_calibration();
+			sensor_calibration_request(-1); // clear request
+			set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
+			break;
+#endif
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+		case 5: // Gyro sensitivity calibration
+			set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
+			sensor_calibrate_sens();
 			sensor_calibration_request(-1); // clear request
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
 			break;

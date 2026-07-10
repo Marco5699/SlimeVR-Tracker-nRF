@@ -24,6 +24,7 @@
 #include "system/system.h"
 #include "system/power.h"
 #include "system/test_mode.h"
+#include "system/esb_ota.h"
 #include "system/watchdog.h"
 #include "util.h"
 #include "connection/connection.h"
@@ -31,6 +32,7 @@
 
 #include <math.h>
 #include <hal/nrf_gpio.h>
+#include <hal/nrf_power.h>
 
 #if CONFIG_CMSIS_DSP
 #include <arm_math.h>
@@ -57,6 +59,42 @@ static sensor_debug_state_t debug_state = {
 	.enabled = false,
 	.output_every_n = 4  // Default: output every 4 accel samples
 };
+
+// Set to 1 to temporarily enable the extra Qdev/Qout debug line
+#ifndef SENSOR_DEBUG_QDEV_QOUT
+#define SENSOR_DEBUG_QDEV_QOUT 0
+#endif
+
+#ifndef SENSOR_REST_ENTER_STABLE_MS
+#define SENSOR_REST_ENTER_STABLE_MS 1500
+#endif
+#ifndef SENSOR_REST_EXIT_MOTION_MS
+#define SENSOR_REST_EXIT_MOTION_MS 120
+#endif
+#ifndef SENSOR_REST_ENTER_GYRO_DPS
+#define SENSOR_REST_ENTER_GYRO_DPS 0.8f
+#endif
+#ifndef SENSOR_REST_EXIT_GYRO_DPS
+#define SENSOR_REST_EXIT_GYRO_DPS 2.0f
+#endif
+#ifndef SENSOR_REST_ENTER_LIN_ACCEL_MS2
+#define SENSOR_REST_ENTER_LIN_ACCEL_MS2 0.35f
+#endif
+#ifndef SENSOR_REST_EXIT_LIN_ACCEL_MS2
+#define SENSOR_REST_EXIT_LIN_ACCEL_MS2 0.9f
+#endif
+#ifndef SENSOR_REST_ENTER_QUAT_RAD
+#define SENSOR_REST_ENTER_QUAT_RAD 0.010f
+#endif
+#ifndef SENSOR_REST_EXIT_QUAT_RAD
+#define SENSOR_REST_EXIT_QUAT_RAD 0.015f
+#endif
+#ifndef SENSOR_REST_VQF_ENTER_DEV
+#define SENSOR_REST_VQF_ENTER_DEV 1.0f
+#endif
+#ifndef SENSOR_REST_VQF_EXIT_DEV
+#define SENSOR_REST_VQF_EXIT_DEV 1.2f
+#endif
 
 #if CONFIG_SENSOR_RANGE_STATS
 // Sensor range tracking state - records min/max values during runtime (not persisted)
@@ -110,7 +148,11 @@ static uint8_t sensor_mag_dev_reg = 0xFF;
 static float q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // vector to hold quaternion
 static float last_q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // vector to hold quaternion
 
-static float q3[4] = {SENSOR_QUATERNION_CORRECTION}; // correction quaternion
+static float sensor_to_device_quat[4] = {SENSOR_QUATERNION_CORRECTION};
+static float sensor_vector_to_device_quat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+#if !SENSOR_QUATERNION_OUTPUT_BIAS_IS_IDENTITY
+static float reported_output_bias_quat[4] = {SENSOR_QUATERNION_OUTPUT_BIAS};
+#endif
 
 static float last_lin_a[3] = {0}; // vector to hold last linear accelerometer
 
@@ -142,6 +184,7 @@ static int force_scan_request_count = 0;
 #define RETAINED_SAVE_INTERVAL_MS 5000
 
 static float max_gyro_speed_square;
+static float rest_max_gyro_speed_square;
 static bool mag_use_oneshot;
 #if !CONFIG_SENSOR_MAG_FIXED_ODR
 static bool mag_skip_oneshot;
@@ -189,6 +232,8 @@ static float gyro_actual_range;   // Actual gyroscope full scale range (deg/s)
 static float sensor_actual_time;
 static int16_t sensor_fifo_threshold;
 static int64_t sensor_data_time; // ticks
+static bool sensor_fast_first_update_pending;
+static bool sensor_wom_fast_wake_resume_pending;
 
 static bool sensor_fusion_init;
 static bool sensor_sensor_init;
@@ -203,12 +248,12 @@ static bool mag_calibrated; // true if magnetometer calibration data is valid
 // set when mag toggle reboot is pending, prevents sensor_retained_write from saving fusion state
 static bool skip_fusion_save;
 
-#if CONFIG_SENSOR_USE_XIOFUSION
-static const sensor_fusion_t *sensor_fusion = &sensor_fusion_fusion; // TODO: change from server
-int fusion_id = FUSION_FUSION;
-#elif CONFIG_SENSOR_USE_VQF
+#if CONFIG_SENSOR_USE_VQF
 static const sensor_fusion_t *sensor_fusion = &sensor_fusion_vqf; // TODO: change from server
 int fusion_id = FUSION_VQF;
+#elif CONFIG_SENSOR_USE_EQF
+static const sensor_fusion_t *sensor_fusion = &sensor_fusion_eqf;
+int fusion_id = FUSION_EQF;
 #endif
 
 static int sensor_imu_id = -1;
@@ -236,6 +281,250 @@ LOG_MODULE_REGISTER(sensor, LOG_LEVEL_DBG);
 #else
 LOG_MODULE_REGISTER(sensor, LOG_LEVEL_INF);
 #endif
+
+#define SENSOR_SCAN_COLD_POWER_UP_DELAY_MS 50
+
+static int sensor_scan_last_power_up_delay_ms = SENSOR_SCAN_COLD_POWER_UP_DELAY_MS;
+
+static int sensor_scan_retry_delay_ms(void)
+{
+	if (sensor_scan_last_power_up_delay_ms < SENSOR_SCAN_COLD_POWER_UP_DELAY_MS)
+		return SENSOR_SCAN_COLD_POWER_UP_DELAY_MS - sensor_scan_last_power_up_delay_ms;
+	return 5;
+}
+
+static uint16_t sensor_fifo_setup_threshold(void)
+{
+	if (sensor_fast_first_update_pending && sensor_fifo_threshold > 1)
+		return 1;
+	return (uint16_t)sensor_fifo_threshold;
+}
+
+#if CONFIG_SENSOR_FAST_WOM_WAKE && NRF_POWER_HAS_GPREGRET \
+	&& (defined(POWER_GPREGRET2_GPREGRET_Msk) || defined(POWER_GPREGRET_MaxCount))
+static bool sensor_consume_wom_fast_wake_hint(void)
+{
+	if (nrf_power_gpregret_get(NRF_POWER, 1) != SENSOR_WOM_FAST_WAKE_GPREGRET)
+		return false;
+	nrf_power_gpregret_set(NRF_POWER, 1, 0);
+	return true;
+}
+#else
+static bool sensor_consume_wom_fast_wake_hint(void)
+{
+	return false;
+}
+#endif
+
+static bool sensor_imu_fast_wom_wake_supported(void)
+{
+	return sensor_imu == &sensor_imu_lsm6dsv || sensor_imu == &sensor_imu_icm45686;
+}
+
+static inline void sensor_compute_device_quat(const float *fused_quat, float *device_quat)
+{
+	q_multiply(fused_quat, sensor_to_device_quat, device_quat);
+}
+
+static inline void sensor_compute_reported_quat(const float *device_quat, float *reported_quat)
+{
+#if SENSOR_QUATERNION_OUTPUT_BIAS_IS_IDENTITY
+	memcpy(reported_quat, device_quat, sizeof(float) * 4);
+#else
+	q_multiply(reported_output_bias_quat, device_quat, reported_quat);
+#endif
+}
+
+static inline void sensor_update_frame_transform_cache(void)
+{
+	// Orientation uses Qdevice = Qfused * Qcorr. For active vector rotation from
+	// sensor frame into device frame, we need the inverse of that basis correction.
+	q_conj(sensor_to_device_quat, sensor_vector_to_device_quat);
+}
+
+static inline void sensor_compute_device_and_reported_quat(
+	const float *fused_quat,
+	float *device_quat,
+	float *reported_quat)
+{
+	sensor_compute_device_quat(fused_quat, device_quat);
+	sensor_compute_reported_quat(device_quat, reported_quat);
+}
+
+static inline void sensor_rotate_sensor_vector_to_device_frame(
+	const float *sensor_vector,
+	float *device_vector)
+{
+	v_rotate(sensor_vector, sensor_vector_to_device_quat, device_vector);
+}
+
+typedef struct {
+	bool initialized;
+	bool resting;
+	int64_t quiet_since_ms;
+	int64_t motion_since_ms;
+	float reference_q[4];
+} sensor_rest_state_t;
+
+typedef struct {
+	bool available;
+	bool detected;
+	float deviations[2];
+} sensor_fusion_rest_sample_t;
+
+static sensor_rest_state_t rest_state = {
+	.initialized = false,
+	.resting = false,
+	.quiet_since_ms = 0,
+	.motion_since_ms = 0,
+	.reference_q = {1.0f, 0.0f, 0.0f, 0.0f}
+};
+
+static void sensor_reset_resting_state(void)
+{
+	rest_state.initialized = false;
+	rest_state.resting = false;
+	rest_state.quiet_since_ms = 0;
+	rest_state.motion_since_ms = 0;
+	rest_state.reference_q[0] = 1.0f;
+	rest_state.reference_q[1] = 0.0f;
+	rest_state.reference_q[2] = 0.0f;
+	rest_state.reference_q[3] = 0.0f;
+	rest_max_gyro_speed_square = 0.0f;
+}
+
+static void sensor_record_rest_gyro_motion(const float *g)
+{
+	float gyro_speed_square = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
+	if (gyro_speed_square > rest_max_gyro_speed_square)
+		rest_max_gyro_speed_square = gyro_speed_square;
+}
+
+static sensor_fusion_rest_sample_t sensor_get_fusion_rest_sample(void)
+{
+	sensor_fusion_rest_sample_t sample = {
+		.available = false,
+		.detected = false,
+		.deviations = {INFINITY, INFINITY}
+	};
+
+#if CONFIG_SENSOR_USE_VQF
+	sample.available = true;
+	sample.detected = vqf_get_rest_detected();
+	vqf_get_relative_rest_deviations(sample.deviations);
+#endif
+
+	return sample;
+}
+
+static bool sensor_fusion_rest_deviations_under(
+	const sensor_fusion_rest_sample_t *fusion_rest,
+	float threshold)
+{
+	return fusion_rest->available
+		&& fusion_rest->deviations[0] < threshold
+		&& fusion_rest->deviations[1] < threshold;
+}
+
+static bool sensor_fusion_rest_deviations_over(
+	const sensor_fusion_rest_sample_t *fusion_rest,
+	float threshold)
+{
+	return fusion_rest->available
+		&& (fusion_rest->deviations[0] > threshold
+			|| fusion_rest->deviations[1] > threshold);
+}
+
+static bool sensor_rest_sample_is_quiet(
+	float gyro_speed,
+	float lin_accel,
+	float quat_delta,
+	const sensor_fusion_rest_sample_t *fusion_rest)
+{
+	bool local_quiet = gyro_speed < SENSOR_REST_ENTER_GYRO_DPS
+		&& lin_accel < SENSOR_REST_ENTER_LIN_ACCEL_MS2
+		&& quat_delta < SENSOR_REST_ENTER_QUAT_RAD;
+
+	if (!fusion_rest->available)
+		return local_quiet;
+
+	bool fusion_quiet = sensor_fusion_rest_deviations_under(fusion_rest, SENSOR_REST_VQF_ENTER_DEV);
+	return fusion_quiet
+		&& quat_delta < SENSOR_REST_ENTER_QUAT_RAD
+		&& (fusion_rest->detected || local_quiet);
+}
+
+static bool sensor_rest_sample_is_active(
+	float gyro_speed,
+	float lin_accel,
+	float quat_delta,
+	const sensor_fusion_rest_sample_t *fusion_rest)
+{
+	bool strong_motion = gyro_speed > SENSOR_REST_EXIT_GYRO_DPS
+		|| lin_accel > SENSOR_REST_EXIT_LIN_ACCEL_MS2;
+	bool slow_orientation_motion = quat_delta > SENSOR_REST_EXIT_QUAT_RAD;
+	bool local_motion_hint = gyro_speed > SENSOR_REST_ENTER_GYRO_DPS
+		|| lin_accel > SENSOR_REST_ENTER_LIN_ACCEL_MS2
+		|| quat_delta > SENSOR_REST_ENTER_QUAT_RAD;
+	bool fusion_motion = sensor_fusion_rest_deviations_over(fusion_rest, SENSOR_REST_VQF_EXIT_DEV)
+		|| (fusion_rest->available
+			&& !fusion_rest->detected
+			&& sensor_fusion_rest_deviations_over(fusion_rest, SENSOR_REST_VQF_ENTER_DEV)
+			&& local_motion_hint);
+
+	return strong_motion || slow_orientation_motion || fusion_motion;
+}
+
+static bool sensor_update_resting_state(const float *current_q, const float *lin_a, int64_t now_ms)
+{
+	if (!rest_state.initialized) {
+		memcpy(rest_state.reference_q, current_q, sizeof(rest_state.reference_q));
+		rest_state.quiet_since_ms = 0;
+		rest_state.motion_since_ms = 0;
+		rest_state.initialized = true;
+		return false;
+	}
+
+	float gyro_speed = sqrtf(rest_max_gyro_speed_square);
+	float zero[3] = {0.0f, 0.0f, 0.0f};
+	float lin_accel = v_diff_mag(lin_a, zero);
+	float quat_delta = q_diff_mag(current_q, rest_state.reference_q);
+	sensor_fusion_rest_sample_t fusion_rest = sensor_get_fusion_rest_sample();
+	bool quiet = sensor_rest_sample_is_quiet(gyro_speed, lin_accel, quat_delta, &fusion_rest);
+	bool active = sensor_rest_sample_is_active(gyro_speed, lin_accel, quat_delta, &fusion_rest);
+
+	if (rest_state.resting) {
+		if (active) {
+			if (rest_state.motion_since_ms == 0)
+				rest_state.motion_since_ms = now_ms;
+			if (now_ms - rest_state.motion_since_ms >= SENSOR_REST_EXIT_MOTION_MS) {
+				rest_state.resting = false;
+				rest_state.quiet_since_ms = 0;
+				memcpy(rest_state.reference_q, current_q, sizeof(rest_state.reference_q));
+			}
+		} else {
+			rest_state.motion_since_ms = 0;
+			if (!quiet)
+				rest_state.quiet_since_ms = 0;
+			else
+				rest_state.quiet_since_ms = now_ms;
+		}
+	} else if (quiet) {
+		if (rest_state.quiet_since_ms == 0)
+			rest_state.quiet_since_ms = now_ms;
+		if (now_ms - rest_state.quiet_since_ms >= SENSOR_REST_ENTER_STABLE_MS) {
+			rest_state.resting = true;
+			rest_state.motion_since_ms = 0;
+			memcpy(rest_state.reference_q, current_q, sizeof(rest_state.reference_q));
+		}
+	} else {
+		rest_state.quiet_since_ms = 0;
+		rest_state.motion_since_ms = 0;
+		memcpy(rest_state.reference_q, current_q, sizeof(rest_state.reference_q));
+	}
+
+	return rest_state.resting;
+}
 
 static int sensor_scan(void);
 static int sensor_init(void);
@@ -304,44 +593,13 @@ int sensor_get_sensor_temperature(float *ptr)
 
 void sensor_scan_thread(void)
 {
-	int err;
 	sys_interface_resume(); // make sure interfaces are enabled
-	err = sensor_scan(); // IMUs discovery
-	if (err)
-	{
-		k_msleep(5);
-		LOG_INF("Retrying sensor detection");
-
-		// Reset address before retrying sensor detection
-		sensor_imu_dev.addr = 0x00;
-
-		err = sensor_scan(); // on POR, the sensor may not be ready yet
-	}
+	(void)sensor_scan(); // IMUs discovery
 	sys_interface_suspend();
-//	if (err)
-//		return err;
 }
 
-int sensor_scan(void)
+static int sensor_scan_imu_once(void)
 {
-	while (sensor_sensor_scanning)
-		k_usleep(1); // already scanning
-	if (sensor_sensor_init)
-		return 0; // already initialized
-	sensor_sensor_scanning = true;
-
-	sensor_scan_read();
-	// Enable external clock for IMU if hardware is available
-	float clock_actual_rate = 0;
-	int clock_err = set_sensor_clock(true, 32768, &clock_actual_rate);
-	if (clock_err == 0 && clock_actual_rate != 0)
-	{
-		LOG_INF("Sensor clock enabled: %.2fHz", (double)clock_actual_rate);
-	}
-
-	// Wait for sensors to power up and stabilize
-	k_msleep(50);
-
 	int imu_id = -1;
 #if SENSOR_IMU_SPI_EXISTS
 	// for SPI scan, set frequency of 10MHz, it will be set later by the driver initialization if needed
@@ -363,6 +621,47 @@ int sensor_scan(void)
 #if !SENSOR_IMU_SPI_EXISTS && !SENSOR_IMU_EXISTS
 	LOG_ERR("IMU node does not exist");
 #endif
+	return imu_id;
+}
+
+int sensor_scan(void)
+{
+	while (sensor_sensor_scanning)
+		k_usleep(1); // already scanning
+	if (sensor_sensor_init)
+		return 0; // already initialized
+	sensor_sensor_scanning = true;
+	sensor_wom_fast_wake_resume_pending = sensor_consume_wom_fast_wake_hint();
+	if (sensor_wom_fast_wake_resume_pending)
+		LOG_INF("WOM fast-wake sensor resume requested");
+
+	sensor_scan_read();
+	// Enable external clock for IMU if hardware is available
+	float clock_actual_rate = 0;
+	int clock_err = set_sensor_clock(true, 32768, &clock_actual_rate);
+	if (clock_err == 0 && clock_actual_rate != 0)
+	{
+		LOG_INF("Sensor clock enabled: %.2fHz", (double)clock_actual_rate);
+	}
+
+	bool retained_imu_known = sensor_imu_dev.addr != 0 || sensor_imu_dev_reg != 0xFF;
+	sensor_scan_last_power_up_delay_ms = retained_imu_known
+		? CONFIG_SENSOR_RETAINED_SCAN_POWER_UP_DELAY_MS
+		: SENSOR_SCAN_COLD_POWER_UP_DELAY_MS;
+	if (sensor_scan_last_power_up_delay_ms > 0)
+		k_msleep(sensor_scan_last_power_up_delay_ms);
+
+	int imu_id = sensor_scan_imu_once();
+	if (imu_id < 0)
+	{
+		int retry_delay_ms = sensor_scan_retry_delay_ms();
+		if (retry_delay_ms > 0)
+			k_msleep(retry_delay_ms);
+		LOG_INF("Retrying sensor detection");
+		sensor_imu_dev.addr = 0x00;
+		sensor_imu_dev_reg = 0xFF;
+		imu_id = sensor_scan_imu_once();
+	}
 	if (imu_id >= (int)ARRAY_SIZE(dev_imu_names))
 		LOG_WRN("Found unknown device");
 	else if (imu_id < 0)
@@ -815,9 +1114,11 @@ static void set_update_time_ms(int time_ms)
 	// TODO: return pin_config and replace call in sensor_init
 #if IMU_INT_EXISTS
 	float fifo_threshold = (float)time_ms / 1000.0f / sensor_actual_time; // target loop rate
-	sensor_fifo_threshold = (int16_t)fifo_threshold;
-	LOG_INF("FIFO THS/WM/WTM: %.2f -> %d", (double)fifo_threshold, sensor_fifo_threshold);
-	sensor_imu->setup_DRDY(sensor_fifo_threshold); // do not need to reset pin config
+	sensor_fifo_threshold = MAX(1, (int16_t)fifo_threshold);
+	uint16_t setup_threshold = sensor_fifo_setup_threshold();
+	LOG_INF("FIFO THS/WM/WTM: %.2f -> %d%s", (double)fifo_threshold,
+		sensor_fifo_threshold, setup_threshold != sensor_fifo_threshold ? " (startup 1)" : "");
+	sensor_imu->setup_DRDY(setup_threshold); // do not need to reset pin config
 #endif
 	sensor_update_time_ms = time_ms; // TODO: terrible naming
 }
@@ -861,16 +1162,26 @@ enum sensor_sensor_timeout {
 };
 
 static enum sensor_sensor_timeout sensor_timeout = SENSOR_SENSOR_TIMEOUT_IMU;
+static bool was_ota_suppressed = false;
 
 // Check the IMU gyroscope // TODO: gyro sanity not used
  // TODO: timeouts and power management should be outside sensor! (ie. sleeping/shutdown even if the imu completely errored out)
  // all this really means is that this should be called in sensor loop while the sensor is in an error state
-static void sensor_update_sensor_state(void)
+static void sensor_update_sensor_state(bool resting)
 {
 	bool calibrating = get_status(SYS_STATUS_CALIBRATION_RUNNING);
-	bool resting = sensor_fusion->get_gyro_sanity() == 0 ? q_epsilon(q, last_q, 0.005) : q_epsilon(q, last_q, 0.05); // TODO: Probably okay to use the constantly updating last_q?
 	bool in_test_mode = test_mode_get();
-	if (!in_test_mode && !calibrating && resting)
+	bool ota_suppressed_now = esb_ota_is_active() || connection_get_ota_suppressed();
+
+	/* Reset activity timer on OTA suppression→unsuppression transition
+	 * to prevent accumulated idle time from immediately triggering sleep
+	 * when suppression lifts between OTA batches. */
+	if (was_ota_suppressed && !ota_suppressed_now) {
+		last_data_time = k_uptime_get();
+	}
+	was_ota_suppressed = ota_suppressed_now;
+
+	if (!in_test_mode && !calibrating && !ota_suppressed_now && resting)
 	{
 		int64_t last_data_delta = k_uptime_get() - last_data_time;
 		if (sensor_mode < SENSOR_SENSOR_MODE_LOW_POWER && last_data_delta > CONFIG_SENSOR_LP_TIMEOUT) // No motion in lp timeout
@@ -928,6 +1239,7 @@ static void sensor_update_sensor_state(void)
 int sensor_init(void)
 {
 	int err;
+	sensor_update_frame_transform_cache();
 	// TODO: on any errors set main_ok false and skip (make functions return nonzero)
 	if (mag_available && mag_enabled) // shutdown magnetometer first only when enabled
 	{
@@ -935,7 +1247,12 @@ int sensor_init(void)
 			sensor_imu->ext_passthrough(true);
 		sensor_mag->shutdown(); // TODO: is this needed?
 	}
-	sensor_imu->shutdown(); // TODO: is this needed?
+	bool fast_wom_wake = sensor_wom_fast_wake_resume_pending && sensor_imu_fast_wom_wake_supported();
+	sensor_wom_fast_wake_resume_pending = false;
+	if (fast_wom_wake)
+		LOG_INF("Skipping IMU pre-init reset after WOM wake");
+	else
+		sensor_imu->shutdown(); // TODO: is this needed?
 
 	// Clock already enabled during sensor scan, just ensure it's still on
 	float clock_actual_rate = 0;
@@ -1043,9 +1360,12 @@ int sensor_init(void)
 #if IMU_INT_EXISTS
 	// Setup interrupt
 	float fifo_threshold = sensor_update_time_ms / 1000.0f / sensor_actual_time; // target loop rate
-	sensor_fifo_threshold = fifo_threshold;
-	LOG_INF("FIFO THS/WM/WTM: %.2f -> %d", (double)fifo_threshold, sensor_fifo_threshold);
-	uint8_t pin_config = sensor_imu->setup_DRDY(sensor_fifo_threshold);
+	sensor_fifo_threshold = MAX(1, (int16_t)fifo_threshold);
+	sensor_fast_first_update_pending = true;
+	uint16_t setup_threshold = sensor_fifo_setup_threshold();
+	LOG_INF("FIFO THS/WM/WTM: %.2f -> %d%s", (double)fifo_threshold,
+		sensor_fifo_threshold, setup_threshold != sensor_fifo_threshold ? " (startup 1)" : "");
+	uint8_t pin_config = sensor_imu->setup_DRDY(setup_threshold);
 	if (pin_config == 0)
 		return -1;
 	uint32_t int0_gpios = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, int0_gpios);
@@ -1065,6 +1385,7 @@ int sensor_init(void)
 	LOG_INF("Initialized fusion");
 	sensor_fusion_init = true;
 	last_mag_fusion_ticks = 0; // reset so first mag update uses nominal mag_actual_time as dt
+	sensor_reset_resting_state();
 	// last_mag_fusion_ticks reset is sufficient; no extra state to clear.
 
 	if (connection_get_data_collection()) {
@@ -1077,7 +1398,8 @@ int sensor_init(void)
 			(uint8_t)sensor_imu_id,
 			(uint8_t)sensor_mag_id
 		);
-		LOG_INF("Data collection mode: metadata sent (gyro %.0fdps, accel %.0fg, gyro ODR %.0fHz)",
+		connection_send_raw_calibration();
+		LOG_INF("Data collection mode: metadata + calibration sent (gyro %.0fdps, accel %.0fg, gyro ODR %.0fHz)",
 			(double)gyro_actual_range, (double)accel_actual_range,
 			1.0 / (double)gyro_actual_time);
 	}
@@ -1092,6 +1414,11 @@ static int64_t last_status_time = 0;
 static int64_t max_loop_time = 0;
 
 static bool last_data_collection_state = false;
+
+/* Raw gyro quaternion accumulator for data collection.
+ * Integrates raw gyro (no bias correction) so offline VQF can re-estimate bias.
+ * Reset when data collection starts. */
+static float raw_gyr_quat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 
 #if DEBUG
 static int64_t last_acquisition_time = INT64_MAX;
@@ -1118,7 +1445,7 @@ static uint32_t mag_vqf_updates_since_status = 0;
  *
  * Triggered by sensor_mag_ref_reset(); does NOT run on startup.
  */
-#define MAG_REF_RECOMPUTE_SAMPLES 50
+#define MAG_REF_RECOMPUTE_SAMPLES 100
 #define MAG_REF_ACCEL_TOL 0.3f
 
 static bool mag_ref_recompute_active;
@@ -1156,7 +1483,9 @@ static void sensor_mag_ref_accumulate(const float m_cal[3],
 	if (mag_ref_count >= MAG_REF_RECOMPUTE_SAMPLES) {
 		float avg_norm = mag_ref_norm_sum / mag_ref_count;
 		float avg_dip = mag_ref_dip_sum / mag_ref_count;
+#if CONFIG_SENSOR_USE_VQF
 		vqf_set_mag_ref(avg_norm, avg_dip);
+#endif
 		mag_ref_recompute_active = false;
 		LOG_INF("Mag ref recomputed from %d samples: norm=%.4f dip=%.1f deg",
 			mag_ref_count, (double)avg_norm,
@@ -1203,6 +1532,11 @@ void sensor_loop(void)
 			bool dc_active = connection_get_data_collection();
 			if (dc_active && !last_data_collection_state) {
 				sys_interface_resume();
+				/* Reset raw gyro quaternion accumulator */
+				raw_gyr_quat[0] = 1.0f;
+				raw_gyr_quat[1] = 0.0f;
+				raw_gyr_quat[2] = 0.0f;
+				raw_gyr_quat[3] = 0.0f;
 				connection_send_raw_metadata(
 					gyro_actual_range,
 					accel_actual_range,
@@ -1212,7 +1546,8 @@ void sensor_loop(void)
 					(uint8_t)sensor_imu_id,
 					(uint8_t)sensor_mag_id
 				);
-				LOG_INF("Data collection activated: metadata sent");
+				connection_send_raw_calibration();
+				LOG_INF("Data collection activated: metadata + calibration sent");
 			} else if (dc_active && connection_raw_metadata_resend_due()) {
 				connection_send_raw_metadata(
 					gyro_actual_range,
@@ -1223,6 +1558,7 @@ void sensor_loop(void)
 					(uint8_t)sensor_imu_id,
 					(uint8_t)sensor_mag_id
 				);
+				connection_send_raw_calibration();
 			}
 			last_data_collection_state = dc_active;
 
@@ -1235,7 +1571,7 @@ void sensor_loop(void)
 
 			// Reading IMUs will take between 2.5ms (~7 samples, low noise) - 7ms (~33 samples, low power)
 			// Magneto sample will take ~400us
-			// Fusing data will take between 100us (~7 samples, low noise) - 500us (~33 samples, low power) for xiofusion
+			// Fusing data will take between 100us (~7 samples, low noise) - 500us (~33 samples, low power)
 			// TODO: on any errors set main_ok false and skip (make functions return nonzero)
 
 			// At high speed, use oneshot mode to have synced magnetometer data
@@ -1252,6 +1588,20 @@ void sensor_loop(void)
 			// - With 4x oversampling at 1600Hz: effectively same as 400Hz but with 4x raw packets
 			uint8_t *rawData = sensor_fifo_raw_buffer;
 			uint16_t packets = sensor_imu->fifo_read(rawData, sizeof(sensor_fifo_raw_buffer));
+#if IMU_INT_EXISTS
+			if (sensor_fast_first_update_pending && packets > 0)
+			{
+				sensor_fast_first_update_pending = false;
+				if (sensor_fifo_threshold > 1)
+				{
+					uint8_t restored_pin_config = sensor_imu->setup_DRDY(sensor_fifo_threshold);
+					if (!restored_pin_config)
+						LOG_WRN("Failed to restore FIFO THS/WM/WTM to %d", sensor_fifo_threshold);
+					else
+						LOG_INF("Restored FIFO THS/WM/WTM to %d", sensor_fifo_threshold);
+				}
+			}
+#endif
 
 #if CONFIG_SENSOR_USE_TCAL
 			// Read IMU temperature after FIFO read so FIFO-backed drivers
@@ -1361,6 +1711,7 @@ void sensor_loop(void)
 			float a_sum[3] = {0};
 			int a_count = 0;
 			max_gyro_speed_square = 0;
+			rest_max_gyro_speed_square = 0;
 			int processed_packets = 0;
 
 			// For debug: accumulate raw and calibrated data
@@ -1392,7 +1743,32 @@ void sensor_loop(void)
 				if (raw_g[0] != 0 || raw_g[1] != 0 || raw_g[2] != 0) {
 					struct raw_imu_sample raw_sample;
 					if (dc_active) {
-						memcpy(raw_sample.gyro, raw_g, sizeof(raw_sample.gyro));
+						/* Integrate raw gyro into quaternion accumulator.
+						 * raw_g is in deg/s; convert to rad/s for integration. */
+						float g_rad[3] = {
+							raw_g[0] * (float)(M_PI / 180.0f),
+							raw_g[1] * (float)(M_PI / 180.0f),
+							raw_g[2] * (float)(M_PI / 180.0f)
+						};
+						float gyr_norm = sqrtf(g_rad[0]*g_rad[0] + g_rad[1]*g_rad[1] + g_rad[2]*g_rad[2]);
+						if (gyr_norm > 1e-6f) {
+							float angle = gyr_norm * gyro_actual_time;
+							float ha = angle * 0.5f;
+							float s = sinf(ha) / gyr_norm;
+							float step[4] = {cosf(ha), s*g_rad[0], s*g_rad[1], s*g_rad[2]};
+							/* q_new = q_old * step */
+							float q0 = raw_gyr_quat[0]*step[0] - raw_gyr_quat[1]*step[1] - raw_gyr_quat[2]*step[2] - raw_gyr_quat[3]*step[3];
+							float q1 = raw_gyr_quat[0]*step[1] + raw_gyr_quat[1]*step[0] + raw_gyr_quat[2]*step[3] - raw_gyr_quat[3]*step[2];
+							float q2 = raw_gyr_quat[0]*step[2] - raw_gyr_quat[1]*step[3] + raw_gyr_quat[2]*step[0] + raw_gyr_quat[3]*step[1];
+							float q3 = raw_gyr_quat[0]*step[3] + raw_gyr_quat[1]*step[2] - raw_gyr_quat[2]*step[1] + raw_gyr_quat[3]*step[0];
+							float inv_norm = 1.0f / sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+							raw_gyr_quat[0] = q0 * inv_norm;
+							raw_gyr_quat[1] = q1 * inv_norm;
+							raw_gyr_quat[2] = q2 * inv_norm;
+							raw_gyr_quat[3] = q3 * inv_norm;
+						}
+
+						memcpy(raw_sample.gyr_quat, raw_gyr_quat, sizeof(raw_sample.gyr_quat));
 						memcpy(raw_sample.accel, raw_collect_a, sizeof(raw_sample.accel));
 						raw_sample.temp_c = raw_collect_temp_c;
 						connection_queue_raw_sample(&raw_sample);
@@ -1478,6 +1854,8 @@ void sensor_loop(void)
 						sensor_update_range_stats_gyro(g_avg);
 #endif // CONFIG_SENSOR_RANGE_STATS
 
+						sensor_record_rest_gyro_motion(g_avg);
+
 						// Process fusion with averaged and calibrated gyro data
 						sensor_fusion->update_gyro(g_avg, gyro_effective_time);
 						g_count++;
@@ -1523,6 +1901,8 @@ void sensor_loop(void)
 					// Update range statistics with calibrated gyro data
 					sensor_update_range_stats_gyro(g);
 #endif // CONFIG_SENSOR_RANGE_STATS
+
+					sensor_record_rest_gyro_motion(g);
 
 					// Process fusion directly
 					sensor_fusion->update_gyro(g, gyro_actual_time);
@@ -1712,8 +2092,9 @@ void sensor_loop(void)
 #endif
 				}
 
-				v_rotate(m, q3, m); // magnetic field in local device frame, no other transformation will be done
-				connection_update_sensor_mag(m);
+				float mag_device[3];
+				sensor_rotate_sensor_vector_to_device_frame(m, mag_device);
+				connection_update_sensor_mag(mag_device);
 			}
 
 			// Copy average acceleration for this frame
@@ -1838,7 +2219,9 @@ void sensor_loop(void)
 			if (v_diff_mag(a, lin_a) != 0) // lin_a as zero vector
 				a_to_lin_a(q, a, lin_a);
 
-			sensor_update_sensor_state();
+			int64_t now = k_uptime_get();
+			bool resting = sensor_update_resting_state(q, lin_a, now);
+			sensor_update_sensor_state(resting);
 
 			// Update magnetometer mode
 #if !CONFIG_SENSOR_MAG_FIXED_ODR
@@ -1935,6 +2318,14 @@ void sensor_loop(void)
 					printk("     VQF: Q[%.3f,%.3f,%.3f,%.3f] LinA[%.2f,%.2f,%.2f]\n",
 						(double)q[0], (double)q[1], (double)q[2], (double)q[3],
 						(double)lin_a[0], (double)lin_a[1], (double)lin_a[2]);
+#if SENSOR_DEBUG_QDEV_QOUT
+					float debug_device_quat[4];
+					float debug_reported_quat[4];
+					sensor_compute_device_and_reported_quat(q, debug_device_quat, debug_reported_quat);
+					printk("     Qdev[%.3f,%.3f,%.3f,%.3f] Qout[%.3f,%.3f,%.3f,%.3f]\n",
+						(double)debug_device_quat[0], (double)debug_device_quat[1], (double)debug_device_quat[2], (double)debug_device_quat[3],
+						(double)debug_reported_quat[0], (double)debug_reported_quat[1], (double)debug_reported_quat[2], (double)debug_reported_quat[3]);
+#endif
 					printk("     Rest:%c RestDev[G:%.3f,A:%.3f] Bias[%.3f,%.3f,%.3f]°/s Sigma:%.3f°/s Delta:%.2f°\n",
 						vqf_info.rest_detected ? 'Y' : 'N',
 						(double)vqf_info.rest_deviations[0], (double)vqf_info.rest_deviations[1],
@@ -1980,6 +2371,14 @@ void sensor_loop(void)
 					printk("     Q[%.3f,%.3f,%.3f,%.3f] LinA[%.2f,%.2f,%.2f]\n",
 						(double)q[0], (double)q[1], (double)q[2], (double)q[3],
 						(double)lin_a[0], (double)lin_a[1], (double)lin_a[2]);
+#if SENSOR_DEBUG_QDEV_QOUT
+					float debug_device_quat[4];
+					float debug_reported_quat[4];
+					sensor_compute_device_and_reported_quat(q, debug_device_quat, debug_reported_quat);
+					printk("     Qdev[%.3f,%.3f,%.3f,%.3f] Qout[%.3f,%.3f,%.3f,%.3f]\n",
+						(double)debug_device_quat[0], (double)debug_device_quat[1], (double)debug_device_quat[2], (double)debug_device_quat[3],
+						(double)debug_reported_quat[0], (double)debug_reported_quat[1], (double)debug_reported_quat[2], (double)debug_reported_quat[3]);
+#endif
 #endif
 				}
 			}
@@ -1989,8 +2388,7 @@ void sensor_loop(void)
 			bool send_lin_accel_data = !v_epsilon(lin_a, last_lin_a, 0.04f);
 
 			// Check if we need to force send based on time to maintain minimum packet rate
-			int64_t now = k_uptime_get();
-			bool resting = sensor_fusion->get_gyro_sanity() == 0 ? q_epsilon(q, last_q, 0.003f) : q_epsilon(q, last_q, 0.05f);
+			now = k_uptime_get();
 			int64_t min_interval = test_mode_get() ? TEST_MODE_MIN_SEND_INTERVAL_MS : 1000;
 			bool force_send_by_time = (now - last_sensor_send_time) >= min_interval;
 
@@ -1998,15 +2396,16 @@ void sensor_loop(void)
 			{
 				memcpy(last_q, q, sizeof(q));
 				memcpy(last_lin_a, lin_a, sizeof(lin_a));
-				float q_offset[4];
-				q_multiply(q, q3, q_offset); // quaternion in device orientation, connection will change format from wxyz to xyzw
-				v_rotate(lin_a, q3, lin_a); // linear acceleration in local device frame, no other transformation will be done
+				float device_quat[4];
+				float reported_quat[4];
+				sensor_compute_device_and_reported_quat(q, device_quat, reported_quat);
+				sensor_rotate_sensor_vector_to_device_frame(lin_a, lin_a);
 
 				if (!send_quat_data && !send_lin_accel_data) {
 					memset(lin_a, 0, sizeof(lin_a)); // zero out linear acceleration when no motion detected
 				}
 
-				connection_update_sensor_data(q_offset, lin_a, sensor_data_time);
+				connection_update_sensor_data(reported_quat, lin_a, sensor_data_time);
 				last_sensor_send_time = now;
 
 				if (!resting) {
@@ -2192,6 +2591,7 @@ void main_imu_restart(void)
 		// Reset mag timing so the first post-restart update uses the nominal fallback
 		// instead of a potentially stale diff (which could be > 10s → updateMag fallback path).
 		last_mag_fusion_ticks = 0;
+		sensor_reset_resting_state();
 	}
 }
 
